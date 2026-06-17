@@ -1,0 +1,60 @@
+name: register-accounts
+
+# Manually triggered. Fans out into a matrix of parallel jobs, each running the
+# sub2api-led OAuth closed loop (CloudMail signup -> codex authorize -> sub2api
+# create-from-oauth, bound to group 额度). Runs bare on the GitHub (Azure) IP.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count_per_job:
+        description: "accounts to register per job"
+        required: false
+        default: "1"
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install browser system libs (Firefox/Camoufox)
+        run: |
+          python -m playwright install-deps firefox || sudo apt-get update && sudo apt-get install -y \
+            libgtk-3-0 libx11-xcb1 libasound2t64 libdbus-glib-1-2 libxtst6 xvfb || true
+          sudo apt-get install -y xvfb || true
+
+      - name: Fetch Camoufox browser + geoip
+        run: python -m camoufox fetch
+
+      - name: Register
+        env:
+          CLOUDMAIL_BASE_URL: ${{ secrets.CLOUDMAIL_BASE_URL }}
+          CLOUDMAIL_PASSWORD: ${{ secrets.CLOUDMAIL_PASSWORD }}
+          CLOUDMAIL_DOMAIN: ${{ secrets.CLOUDMAIL_DOMAIN }}
+          SUB2API_URL: ${{ secrets.SUB2API_URL }}
+          SUB2API_EMAIL: ${{ secrets.SUB2API_EMAIL }}
+          SUB2API_PASSWORD: ${{ secrets.SUB2API_PASSWORD }}
+          SUB2API_GROUP: ${{ secrets.SUB2API_GROUP }}
+          VERIFY_PROXY: ""
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a python register_sub2api_oauth.py "${{ github.event.inputs.count_per_job || '1' }}"
