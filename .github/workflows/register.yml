@@ -8,7 +8,7 @@ on:
   schedule:
     # 每 30 分钟(UTC)。定时触发只用 inputs 默认值(count_per_job=2 + 默认域名列表)。
     # 仅在默认分支运行；仓库 60 天无提交会被 GitHub 自动停用定时。
-    - cron: "0 */2 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       count_per_job:
@@ -22,7 +22,7 @@ on:
       threshold:
         description: "只有活跃账号数低于此值才注册(维持目标池大小)"
         required: false
-        default: "100"
+        default: "200"
 
 jobs:
   # 先查活号数：>= threshold 就不跑注册矩阵，cron 自我调节、不过量注册。
