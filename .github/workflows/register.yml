@@ -66,6 +66,9 @@ jobs:
           # two accounts (plus a stuck one's clean exit) finish before the cap.
           OAUTH_DEADLINE_SECONDS: "100"
           OTP_TIMEOUT: "85"
+          # Wall-clock budget: stop opening new accounts past this, so the job
+          # finishes cleanly before the 4-min step timeout (no kill mid-write).
+          JOB_BUDGET_SECONDS: "210"
           PYTHONUNBUFFERED: "1"
         run: |
           xvfb-run -a python register_sub2api_oauth.py "${{ github.event.inputs.count_per_job || '1' }}"
