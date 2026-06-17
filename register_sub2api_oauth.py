@@ -75,10 +75,31 @@ def run_one(client: Sub2ApiClient, group_id: int) -> dict:
             "account_id": acct_id, "status": status}
 
 
+def _pick_domain():
+    """OpenAI caps ~20 signups per email domain per burst. Spread jobs across a
+    domain list (CLOUDMAIL_DOMAINS, comma-separated) by JOB_INDEX so each domain
+    stays under the cap. Falls back to CLOUDMAIL_DOMAIN."""
+    raw = os.getenv("CLOUDMAIL_DOMAINS") or os.getenv("CLOUDMAIL_DOMAIN") or ""
+    domains = [d.strip().lstrip("@") for d in raw.replace(";", ",").split(",") if d.strip()]
+    if not domains:
+        return None
+    idx = 0
+    try:
+        idx = max(0, int(os.getenv("JOB_INDEX") or "1") - 1)
+    except ValueError:
+        idx = 0
+    chosen = domains[idx % len(domains)]
+    os.environ["CLOUDMAIL_DOMAIN"] = chosen  # CloudMailEmailService reads this
+    return chosen
+
+
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    chosen_domain = _pick_domain()
     client = Sub2ApiClient()
     client.ensure_configured()
+    if chosen_domain:
+        log.info(f"JOB_INDEX={os.getenv('JOB_INDEX', '?')} -> domain {chosen_domain}")
     log.info(f"sub2api = {client.base_url}  browser_proxy = {PROXY or '(direct)'}")
     group_id = client.resolve_sold_group_id()
     log.info(f"group '{client.sold_group_spec}' -> id {group_id}")
