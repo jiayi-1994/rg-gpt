@@ -83,7 +83,7 @@ jobs:
         run: python fetch_camoufox.py
 
       - name: Register
-        timeout-minutes: 6
+        timeout-minutes: 9
         env:
           CLOUDMAIL_BASE_URL: ${{ secrets.CLOUDMAIL_BASE_URL }}
           CLOUDMAIL_PASSWORD: ${{ secrets.CLOUDMAIL_PASSWORD }}
@@ -98,9 +98,10 @@ jobs:
           OAUTH_DEADLINE_SECONDS: "100"
           OTP_TIMEOUT: "85"
           # Wall-clock budget: stop opening new accounts past this, so the job
-          # finishes cleanly before the 6-min step timeout (no kill mid-write).
-          # ~48s/account => fits count_per_job up to ~5 within the window.
-          JOB_BUDGET_SECONDS: "280"
+          # finishes cleanly before the 9-min step timeout (no kill mid-write).
+          # ~64s/account => 500s comfortably fits count_per_job=5 (even with a
+          # stuck one). Must stay below the step timeout (540s) above.
+          JOB_BUDGET_SECONDS: "500"
           PYTHONUNBUFFERED: "1"
         run: |
           xvfb-run -a python register_sub2api_oauth.py "${{ github.event.inputs.count_per_job || '1' }}"
