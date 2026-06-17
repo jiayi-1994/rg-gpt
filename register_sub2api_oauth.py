@@ -60,7 +60,8 @@ def run_one(client: Sub2ApiClient, group_id: int) -> dict:
     res = browser_oauth_signup(Cfg(), mail, auth_url=auth_url, exchange=False)
     email = res.get("email", "")
     if not res.get("code"):
-        return {"ok": False, "stage": "browser", "email": email, "add_phone": res.get("add_phone")}
+        return {"ok": False, "stage": "browser", "email": email,
+                "add_phone": res.get("add_phone"), "reason": res.get("error") or "no_code_timeout"}
 
     acct = client.create_openai_account_from_oauth(
         session_id=session_id,

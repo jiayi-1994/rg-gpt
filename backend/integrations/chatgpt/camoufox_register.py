@@ -924,6 +924,18 @@ def browser_oauth_signup(cfg, mail_provider, oauth_session=None, auth_url=None, 
                     logger.info(f"[oauth-signup] URL: {cur[:110]}")
                     last_state = cur
 
+                # 账号创建被拒(域名/限速配额)会在密码页就地报错且不前进；早退,别空等满超时。
+                if pwd_done and not otp_done and "create-account" in low:
+                    try:
+                        body_txt = (page.inner_text("body") or "")[:3000].lower()
+                    except Exception:
+                        body_txt = ""
+                    if ("failed to create account" in body_txt or "创建帐户失败" in body_txt
+                            or "创建账户失败" in body_txt or "account_creation_failed" in body_txt):
+                        logger.warning("[oauth-signup] 页面报 account_creation_failed(域名/限速配额),早退")
+                        result["error"] = "account_creation_failed"
+                        break
+
                 # 1) 邮箱
                 if not email_done:
                     ein = _first_visible(page, ['input[type="email"]', 'input[name="email"]',
