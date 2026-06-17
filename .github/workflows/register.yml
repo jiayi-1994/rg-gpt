@@ -10,11 +10,11 @@ on:
       count_per_job:
         description: "accounts to register per job"
         required: false
-        default: "1"
+        default: "2"
       domains:
         description: "CloudMail domains, comma-separated (jobs spread across them; OpenAI caps ~20/domain)"
         required: false
-        default: "edu.jiayi.ggff.net,edu.xjy.hidns.vip"
+        default: "jiayi.dpdns.org,jiayi.ggff.net,edu.jiayi.ggff.net,xjy.hidns.vip,edu.xjy.hidns.vip,sub.xjy.hidns.vip,sub1.xjy.hidns.vip,sub2.xjy.hidns.vip,sub3.xjy.hidns.vip,sub4.xjy.hidns.vip,sub5.xjy.hidns.vip,sub6.xjy.hidns.vip,sub7.xjy.hidns.vip,sub8.xjy.hidns.vip,sub9.xjy.hidns.vip,sub10.xjy.hidns.vip,sub11.xjy.hidns.vip,sub12.xjy.hidns.vip,sub13.xjy.hidns.vip,sub14.xjy.hidns.vip,sub15.xjy.hidns.vip,sub16.xjy.hidns.vip,sub17.xjy.hidns.vip,sub18.xjy.hidns.vip,sub19.xjy.hidns.vip,sub20.xjy.hidns.vip"
 
 jobs:
   register:
@@ -51,7 +51,7 @@ jobs:
         run: python fetch_camoufox.py
 
       - name: Register
-        timeout-minutes: 3
+        timeout-minutes: 4
         env:
           CLOUDMAIL_BASE_URL: ${{ secrets.CLOUDMAIL_BASE_URL }}
           CLOUDMAIL_PASSWORD: ${{ secrets.CLOUDMAIL_PASSWORD }}
@@ -62,10 +62,10 @@ jobs:
           SUB2API_PASSWORD: ${{ secrets.SUB2API_PASSWORD }}
           SUB2API_GROUP: ${{ secrets.SUB2API_GROUP }}
           VERIFY_PROXY: ${{ secrets.VERIFY_PROXY }}
-          # Self-exit before the 3-min step timeout: give the signup ~140s and
-          # the OTP wait ~110s, so a Turnstile-stuck job ends cleanly (not killed).
-          OAUTH_DEADLINE_SECONDS: "140"
-          OTP_TIMEOUT: "110"
+          # count_per_job=2 within a 4-min step: bound each account to ~100s so
+          # two accounts (plus a stuck one's clean exit) finish before the cap.
+          OAUTH_DEADLINE_SECONDS: "100"
+          OTP_TIMEOUT: "85"
           PYTHONUNBUFFERED: "1"
         run: |
           xvfb-run -a python register_sub2api_oauth.py "${{ github.event.inputs.count_per_job || '1' }}"
