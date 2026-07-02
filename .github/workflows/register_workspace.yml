@@ -55,6 +55,7 @@ jobs:
       - name: Install browser system libs (Firefox/Camoufox)
         run: |
           python -m playwright install-deps firefox || true
+          sudo apt-get update && sudo apt-get install -y xvfb || true
 
       - name: Fetch Camoufox browser + geoip
         env:
@@ -78,8 +79,5 @@ jobs:
           OTP_TIMEOUT: "100"
           JOB_BUDGET_SECONDS: "1000"
           PYTHONUNBUFFERED: "1"
-        # Headless (no xvfb -> no DISPLAY): camoufox 0.4.11's headed-Linux browser
-        # rejects playwright's viewport.isMobile ("not described in this scheme"), which
-        # crashed launch under xvfb. Headless matches the verified-working local config.
         run: |
-          python register_workspace.py "${{ github.event.inputs.count_per_job || '1' }}"
+          xvfb-run -a python register_workspace.py "${{ github.event.inputs.count_per_job || '1' }}"

@@ -1,8 +1,9 @@
-# Pinned: newer playwright sends viewport.isMobile which the camoufox 0.4.11
-# browser's juggler rejects ("not described in this scheme"), crashing launch on
-# CI. Keep camoufox + playwright at the locally-verified working pair.
+# Pinned: playwright 1.61.0 (2026-06-29) sends viewport.isMobile which the Linux
+# camoufox 0.4.11 browser's juggler rejects ("not described in this scheme"),
+# crashing launch on CI. 1.60.0 is the last version whose juggler matches (CI
+# register.yml launched fine on 2026-06-22 with it). Keep camoufox + playwright here.
 camoufox[geoip]==0.4.11
-playwright==1.61.0
+playwright==1.60.0
 browserforge>=1.2.0
 curl_cffi>=0.15.0
 requests>=2.31.0
