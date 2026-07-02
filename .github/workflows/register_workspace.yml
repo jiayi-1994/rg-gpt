@@ -1,9 +1,9 @@
 name: register-workspace (outlook pool)
 
-# Manually triggered. Each matrix job leases Outlook account(s) from the pool web
-# service (atomic, so parallel jobs never collide), signs up ChatGPT, joins the k12
-# workspace, imports the session into sub2api, and reports success/failed back to the
-# pool. Finite pool -> manual dispatch, not a cron.
+# Manually triggered. A setup job builds a matrix of exactly `parallel_jobs` jobs;
+# each leases Outlook account(s) from the pool web service (atomic, so parallel jobs
+# never collide), signs up ChatGPT, joins the k12 workspace, imports the session into
+# sub2api, and reports success/failed back to the pool. Finite pool -> manual dispatch.
 
 on:
   workflow_dispatch:
@@ -18,51 +18,51 @@ on:
         default: "5"
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          N="${{ github.event.inputs.parallel_jobs || '5' }}"
+          [ "$N" -lt 1 ] 2>/dev/null && N=1
+          [ "$N" -gt 10 ] 2>/dev/null && N=10
+          echo "matrix=$(seq 1 "$N" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "will spawn $N job(s)"
+
   register:
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       max-parallel: 10
       matrix:
-        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        n: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
-      # Only run jobs up to the requested parallel_jobs count.
-      - id: gate
-        run: |
-          if [ "${{ matrix.n }}" -le "${{ github.event.inputs.parallel_jobs || '5' }}" ]; then
-            echo "run=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=0" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == '1'
         with:
           python-version: "3.12"
 
       - name: Install Python deps
-        if: steps.gate.outputs.run == '1'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Install browser system libs (Firefox/Camoufox)
-        if: steps.gate.outputs.run == '1'
         run: |
           python -m playwright install-deps firefox || true
           sudo apt-get update && sudo apt-get install -y xvfb || true
 
       - name: Fetch Camoufox browser + geoip
-        if: steps.gate.outputs.run == '1'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python fetch_camoufox.py
 
       - name: Register from pool
-        if: steps.gate.outputs.run == '1'
         timeout-minutes: 20
         env:
           MAIL_PROVIDER: outlook
