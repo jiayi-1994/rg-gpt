@@ -7,3 +7,7 @@ __pycache__/
 !.env.example
 /tmp/
 *.log
+
+# Outlook account pool holds passwords + refresh_tokens; never commit.
+outlook/accounts.txt
+outlook/.used

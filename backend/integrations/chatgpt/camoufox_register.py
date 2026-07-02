@@ -146,12 +146,67 @@ def _codex_authorize_capture(ctx, page, oauth_session, proxy, log) -> dict:
     return captured
 
 
-def browser_register(cfg, mail_provider, oauth_session=None) -> dict:
+def _join_workspace(page, workspace_id, access_token, device_id, log, *, route="request", max_retries=3) -> bool:
+    """在浏览器上下文内向母号 workspace 发加入申请（复刻已测通的油猴 sendOne 逻辑）。
+
+    必须在浏览器里 page.evaluate 跑 —— chatgpt.com/backend-api 有 Cloudflare 防护，
+    浏览器外的 Python 请求会被挡；浏览器里带真实指纹+cookie 才过。
+    route: "request"(主动申请, 母号自动批准) 或 "accept"(接受已有邀请)。
+    """
+    at = access_token
+    for attempt in range(max_retries + 1):
+        try:
+            res = page.evaluate(
+                """async (a) => {
+                    const url = `/backend-api/accounts/${a.ws}/invites/${a.route}`;
+                    const r = await fetch(url, {
+                        method: "POST",
+                        headers: {
+                            accept: "*/*",
+                            authorization: "Bearer " + a.at,
+                            "content-type": "application/json",
+                            "oai-device-id": a.dev || crypto.randomUUID(),
+                            "oai-language": navigator.language || "en-US",
+                        },
+                        body: "", mode: "cors", credentials: "include",
+                    });
+                    let t = ""; try { t = await r.text(); } catch (_) {}
+                    return { status: r.status, ok: r.ok, text: (t || "").slice(0, 300) };
+                }""",
+                {"ws": workspace_id, "at": at, "dev": device_id or "", "route": route},
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[join] evaluate 异常: {str(e)[:80]}")
+            res = None
+        if res and res.get("ok"):
+            log(f"[join] ✓ {workspace_id[:8]} HTTP {res.get('status')}: {str(res.get('text'))[:120]}")
+            return True
+        code = (res or {}).get("status")
+        log(f"[join] ✗ {workspace_id[:8]} HTTP {code}: {str((res or {}).get('text'))[:150]}")
+        # 401/403 → 子号 AT 失效，重取 session 再试（同油猴逻辑）
+        if code in (401, 403):
+            try:
+                s = page.evaluate(
+                    """async () => { const r = await fetch("/api/auth/session", {credentials:"include"});
+                        return await r.json(); }"""
+                )
+                if isinstance(s, dict) and s.get("accessToken"):
+                    at = s["accessToken"]
+            except Exception:  # noqa: BLE001
+                pass
+        if attempt < max_retries:
+            time.sleep(3 * (attempt + 1))
+    return False
+
+
+def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "") -> dict:
     """
     用真实浏览器走注册流程。
     cfg: Config 实例（需要 proxy 字段）
     mail_provider: MailProvider 实例（调 create_mailbox + wait_for_otp）
     oauth_session: 可选 OAuthSession；提供则注册完成后在同会话里跑 codex 授权拿 refresh_token。
+    join_workspace_id: 可选 workspace id；提供则到达 chatgpt.com 后在同会话里申请加入该 workspace，
+                       并把 chatgpt_account_id 写进返回结果（供 CPA/session 导入选定工作空间）。
     返回 dict：与 AuthResult.to_dict() 格式兼容
     """
     from camoufox.sync_api import Camoufox
@@ -705,6 +760,25 @@ def browser_register(cfg, mail_provider, oauth_session=None) -> dict:
                 f"[browser-reg] session_token={'yes' if result['session_token'] else 'no'} "
                 f"device_id={result['device_id'][:16]}..."
             )
+
+            # [9.5] 可选：申请加入母号 workspace（session/CPA 模型靠这拿到 k12 套餐）。
+            #        浏览器内执行以过 Cloudflare；join 后重取 session（AT 可能刷新）。
+            if join_workspace_id:
+                joined = _join_workspace(
+                    page, join_workspace_id, result["access_token"], result["device_id"], logger.info
+                )
+                result["workspace_joined"] = joined
+                result["chatgpt_account_id"] = join_workspace_id  # sub2api 靠它发 chatgpt-account-id 头选 workspace
+                try:
+                    s2 = page.evaluate(
+                        """async () => { const r = await fetch("/api/auth/session", {credentials:"include"});
+                            return await r.json(); }"""
+                    )
+                    if isinstance(s2, dict) and s2.get("accessToken"):
+                        result["access_token"] = s2.get("accessToken") or result["access_token"]
+                        result["id_token"] = s2.get("idToken", "") or result["id_token"]
+                except Exception:  # noqa: BLE001
+                    pass
 
             # [10] 可选：同会话跑 codex 授权拿 refresh_token（复刻 sub2api OAuth 添加账号）
             if oauth_session is not None:

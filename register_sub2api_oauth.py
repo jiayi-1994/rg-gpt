@@ -20,22 +20,32 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
 from backend.integrations.chatgpt.camoufox_register import browser_oauth_signup
-from backend.integrations.mail.cloudmail import CloudMailEmailService
 from backend.integrations.sub2api import Sub2ApiClient
 
 log = logging.getLogger("runner")
 PROXY = os.getenv("VERIFY_PROXY", "").strip()  # empty = direct
+MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "cloudmail").strip().lower()
 
 
 class Cfg:
     proxy = PROXY
 
 
+def _build_mail_service():
+    """Select the email backend. cloudmail mints infinite temp addresses;
+    outlook claims one pre-provisioned mailbox per signup (finite pool)."""
+    if MAIL_PROVIDER == "outlook":
+        from backend.integrations.mail.outlook import OutlookEmailService
+        return OutlookEmailService()
+    from backend.integrations.mail.cloudmail import CloudMailEmailService
+    return CloudMailEmailService()
+
+
 class MailAdapter:
-    """CloudMailEmailService adapted to browser_oauth_signup's mail_provider API."""
+    """Email service adapted to browser_oauth_signup's mail_provider API."""
 
     def __init__(self):
-        self.svc = CloudMailEmailService()
+        self.svc = _build_mail_service()
         self.last_persona = None
         self.email = ""
 
@@ -96,11 +106,26 @@ def _pick_domain():
 
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    chosen_domain = _pick_domain()
+    # outlook: finite pool, one signup per mailbox — cap count at this job's slice.
+    if MAIL_PROVIDER == "outlook":
+        from backend.integrations.mail.outlook import OutlookEmailService
+        _svc = OutlookEmailService()
+        _used = _svc._load_used()
+        avail = sum(1 for e, a in _svc._accounts.items() if a.bootstrapped and e not in _used)
+        if avail == 0:
+            log.info("==== 无可用 Outlook 账号(本 job 分片为空/均已使用), 跳过 ====")
+            return
+        if avail < count:
+            log.info(f"Outlook 池仅 {avail} 个可用, 本 job count {count}->{avail}")
+            count = avail
+        chosen_domain = None
+    else:
+        chosen_domain = _pick_domain()
     client = Sub2ApiClient()
     client.ensure_configured()
     if chosen_domain:
         log.info(f"JOB_INDEX={os.getenv('JOB_INDEX', '?')} -> domain {chosen_domain}")
+    log.info(f"mail_provider = {MAIL_PROVIDER}")
     log.info(f"sub2api = {client.base_url}  browser_proxy = {PROXY or '(direct)'}")
     group_id = client.resolve_sold_group_id()
     log.info(f"group '{client.sold_group_spec}' -> id {group_id}")
