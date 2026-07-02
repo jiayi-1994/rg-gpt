@@ -270,12 +270,16 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
     return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
 
 
-def _select_auth_workspace(page, workspace_id, log, *, timeout=30) -> bool:
+def _select_auth_workspace(page, workspace_id, log, *, timeout=60) -> bool:
     """On auth.openai.com/workspace (already-registered accounts land here after email OTP),
-    pick a workspace so the flow continues to chatgpt.com. Clicking an entry lets the SPA
-    POST /api/accounts/workspace/select + navigate itself; which entry we pick doesn't matter
-    since the downstream exchange-switch re-scopes the token to workspace_id anyway.
+    pick a workspace so the flow continues to chatgpt.com.
+
+    Click the entry ONCE and let the SPA POST /api/accounts/workspace/select + navigate
+    itself — do NOT inject a page.goto while it navigates; that races the SPA and can crash
+    the Firefox driver on an uncaught pageError (pageError.location.url undefined). Which
+    entry we pick doesn't matter; the downstream exchange-switch re-scopes to workspace_id.
     """
+    clicked = False
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -283,39 +287,35 @@ def _select_auth_workspace(page, workspace_id, log, *, timeout=30) -> bool:
         except Exception:  # noqa: BLE001
             low = ""
         if "/workspace" not in low:
-            return True
-        picked = False
-        for sel in ['text=/schools\\.nyc\\.gov/i', 'text=/workspace #\\d/i',
-                    '[data-testid*="workspace"]', 'button:has-text("Workspace")',
-                    'a:has-text("Workspace")']:
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    _robust_click(page, el, log, "ws-select")
-                    log(f"[ws-select] 点击 workspace 条目: {sel}")
-                    picked = True
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        if not picked and workspace_id:
-            # 兜底：直接 POST 选定 workspace_id，再手动导航到 chatgpt.com
-            try:
-                page.evaluate(
-                    """async (ws) => { try { await fetch('/api/accounts/workspace/select',
-                        {method:'POST', credentials:'include',
-                         headers:{'content-type':'application/json','accept':'application/json'},
-                         body: JSON.stringify({workspace_id: ws})}); } catch(e){} }""",
-                    workspace_id,
-                )
-                log("[ws-select] POST /api/accounts/workspace/select (兜底)")
-                time.sleep(2)
+            return True  # SPA navigated off the select page — done
+        if not clicked:
+            for sel in ['text=/schools\\.nyc\\.gov/i', 'text=/workspace #\\d/i',
+                        '[data-testid*="workspace"]', 'button:has-text("Workspace")',
+                        'a:has-text("Workspace")']:
                 try:
-                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000)
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        _robust_click(page, el, log, "ws-select")
+                        log(f"[ws-select] 点击 workspace 条目: {sel}")
+                        clicked = True
+                        break
                 except Exception:  # noqa: BLE001
-                    pass
-            except Exception:  # noqa: BLE001
-                pass
-        time.sleep(3)
+                    continue
+        time.sleep(2)  # 等 SPA 自己导航，不插 goto
+    # 仅点击彻底没生效时的兜底：POST 选定 workspace，绝不 goto（避免撞 SPA 导航崩 driver）
+    if workspace_id and "/workspace" in ((page.url or "").lower() if True else ""):
+        try:
+            page.evaluate(
+                """async (ws) => { try { await fetch('/api/accounts/workspace/select',
+                    {method:'POST', credentials:'include',
+                     headers:{'content-type':'application/json','accept':'application/json'},
+                     body: JSON.stringify({workspace_id: ws})}); } catch(e){} }""",
+                workspace_id,
+            )
+            log("[ws-select] POST /api/accounts/workspace/select 兜底(无 goto)")
+            time.sleep(5)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         return "/workspace" not in (page.url or "").lower()
     except Exception:  # noqa: BLE001
