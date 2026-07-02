@@ -673,17 +673,21 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 except Exception:
                     pass
 
-            # [5.5] 已注册账号：邮箱 OTP 后落到 /workspace 选择页（非新号的 /about-you）。
-            #        选 workspace 继续到 chatgpt.com，并标记"已是成员"以跳过后面的 join。
-            time.sleep(3)
-            try:
-                _url_now = page.url or ""
-            except Exception:  # noqa: BLE001
-                _url_now = ""
-            if "/workspace" in _url_now.lower():
-                logger.info(f"[browser-reg] 命中 workspace 选择页(已注册账号): {_url_now[:80]}")
-                _select_auth_workspace(page, join_workspace_id or "", logger.info)
-                result["via_workspace_select"] = True
+            # [5.5] OTP 后重定向到 /workspace(已注册账号) 或 /about-you(新号)。重定向可能晚到
+            #        ~30s，所以轮询等待；命中 /workspace 就选择 workspace 继续，并标记已是成员。
+            for _ in range(45):
+                time.sleep(1)
+                try:
+                    _u = (page.url or "").lower()
+                except Exception:  # noqa: BLE001
+                    _u = ""
+                if "/workspace" in _u:
+                    logger.info("[browser-reg] 命中 workspace 选择页(已注册账号)")
+                    _select_auth_workspace(page, join_workspace_id or "", logger.info)
+                    result["via_workspace_select"] = True
+                    break
+                if "about-you" in _u or ("chatgpt.com" in _u and "auth.openai.com" not in _u):
+                    break
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
@@ -744,6 +748,8 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
             birthday_input = None
             birthday_meta = None
             for attempt in range(30):
+                if result.get("via_workspace_select"):
+                    break  # 已注册账号走了 workspace 选择, 没有 about-you 表单
                 metas = _enum_inputs()
                 visible_metas = [m for m in metas if m["visible"]
                                   and m["type"] not in ("hidden","submit","button",
