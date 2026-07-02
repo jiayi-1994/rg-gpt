@@ -270,7 +270,7 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
     return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
 
 
-def _select_auth_workspace(page, workspace_id, log, *, timeout=60) -> bool:
+def _select_auth_workspace(page, workspace_id, log, *, timeout=15) -> bool:
     """On auth.openai.com/workspace (already-registered accounts land here after email OTP),
     pick a workspace so the flow continues to chatgpt.com.
 
