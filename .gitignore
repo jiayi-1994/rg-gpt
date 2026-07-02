@@ -11,3 +11,8 @@ __pycache__/
 # Outlook account pool holds passwords + refresh_tokens; never commit.
 outlook/accounts.txt
 outlook/.used
+
+# Pool web service SQLite DB (passwords + refresh_tokens).
+pool/*.db
+pool/*.db-wal
+pool/*.db-shm

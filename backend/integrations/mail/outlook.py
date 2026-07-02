@@ -322,6 +322,36 @@ def _used_marker_path() -> str:
     return os.path.join(os.path.dirname(_default_accounts_path()), ".used")
 
 
+class _PoolClient:
+    """Thin client for the pool web service (pool/app.py)."""
+
+    def __init__(self, base_url: str, api_key: str, timeout: int = 30) -> None:
+        self.base = base_url.rstrip("/")
+        self.key = api_key
+        self.timeout = timeout
+        self._s = requests.Session()
+
+    def _headers(self) -> dict[str, str]:
+        return {"X-API-Key": self.key, "Content-Type": "application/json"}
+
+    def stats(self) -> dict[str, Any]:
+        r = self._s.get(f"{self.base}/api/stats", headers=self._headers(), timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def lease(self, count: int = 1, leased_by: str = "") -> list[dict[str, Any]]:
+        r = self._s.post(f"{self.base}/api/lease", headers=self._headers(),
+                         json={"count": count, "leased_by": leased_by}, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json().get("leased") or []
+
+    def report(self, acct_id: int, status: str, **fields: Any) -> dict[str, Any]:
+        r = self._s.post(f"{self.base}/api/accounts/{acct_id}/result", headers=self._headers(),
+                         json={"status": status, **fields}, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+
 # ---- service ------------------------------------------------------------------
 
 
@@ -343,7 +373,16 @@ class OutlookEmailService:
         self._lock = threading.Lock()
         self._claimed_email: str | None = None
         self._fixed_email = str(self._extra.get("fixed_email") or "").strip().lower()
-        self._accounts = {a.email: a for a in _partition_for_job(load_accounts())}
+        # Pool mode: lease accounts from the pool web service instead of a local file,
+        # so parallel CI jobs / re-runs never collide and results are written back.
+        self._pool_url = _cfg("OUTLOOK_POOL_URL")
+        self._pool_key = _cfg("POOL_API_KEY")
+        self.pool_mode = bool(self._pool_url and self._pool_key)
+        self._pool = _PoolClient(self._pool_url, self._pool_key) if self.pool_mode else None
+        self._leased: dict[str, Any] | None = None
+        self._accounts: dict[str, OutlookAccount] = (
+            {} if self.pool_mode else {a.email: a for a in _partition_for_job(load_accounts())}
+        )
         self._poll_interval = float(settings.get_int("email_poll_interval_seconds", 5)) or DEFAULT_POLL_INTERVAL
 
     @property
@@ -357,10 +396,58 @@ class OutlookEmailService:
             if self._fixed_email:
                 self._claimed_email = self._fixed_email
                 return {"email": self._fixed_email}
+            if self.pool_mode:
+                return self._lease_from_pool()
             acct = self._claim_unused()
             self._claimed_email = acct.email
             logger.info("[Outlook] claimed account: %s", acct.email)
             return {"email": acct.email}
+
+    def _lease_from_pool(self) -> dict[str, str]:
+        leased = self._pool.lease(count=1, leased_by=_cfg("JOB_INDEX") or "runner")  # type: ignore[union-attr]
+        if not leased:
+            raise RuntimeError("Outlook 池已空：pool 无可租用账号（available=0）")
+        a = leased[0]
+        acct = OutlookAccount(
+            email=str(a["email"]).lower(), password=a.get("password", ""),
+            refresh_token=a.get("refresh_token", ""), client_id=a.get("client_id") or THUNDERBIRD_CLIENT_ID,
+        )
+        self._accounts[acct.email] = acct
+        self._leased = {"id": a["id"], "email": acct.email, "lease_token": a.get("lease_token", "")}
+        self._claimed_email = acct.email
+        logger.info("[Outlook] leased from pool: %s (id=%s)", acct.email, a["id"])
+        return {"email": acct.email}
+
+    def available_for_lease(self) -> int:
+        """Available (bootstrapped, unused) count — pool available, or local pool size."""
+        if self.pool_mode:
+            try:
+                return int(self._pool.stats().get("available", 0))  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Outlook] pool stats failed: %s", exc)
+                return 0
+        used = self._load_used()
+        return sum(1 for e, a in self._accounts.items() if a.bootstrapped and e not in used)
+
+    def report_result(self, status: str, *, reason: str = "", sub2api_account_id: str = "",
+                      workspace_id: str = "") -> None:
+        """Write the outcome of the current leased account back to the pool (pool mode only)."""
+        if not (self.pool_mode and self._leased):
+            return
+        acct = self._accounts.get(self._leased["email"])
+        rt = acct.refresh_token if acct else ""  # possibly rotated during OTP read
+        try:
+            self._pool.report(  # type: ignore[union-attr]
+                int(self._leased["id"]), status, reason=reason[:500],
+                sub2api_account_id=sub2api_account_id, workspace_id=workspace_id,
+                refresh_token=rt, lease_token=self._leased.get("lease_token", ""),
+            )
+            logger.info("[Outlook] pool result %s for %s (id=%s)",
+                        status, self._leased["email"], self._leased["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Outlook] report_result failed: %s", exc)
+        finally:
+            self._leased = None  # avoid double-report
 
     def get_verification_code(
         self,

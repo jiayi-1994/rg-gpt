@@ -95,31 +95,29 @@ def build_cpa_payload(email: str, access_token: str, workspace_id: str, *,
     }
 
 
-def _bind_group(client: Sub2ApiClient, email: str, group_id: int) -> None:
-    """Best-effort: find the just-imported account by email and move it to the sold group.
-    Import does not accept group_ids, so we bind in a follow-up call."""
-    if not group_id:
-        return
+def _bind_group(client: Sub2ApiClient, email: str, group_id: int) -> str:
+    """Find the just-imported account by email, move it to the sold group, return its id."""
+    acct_id = ""
     try:
         listing = client.list_accounts(platform="openai", search=email, page_size=5)
         rows = (listing.get("data") or {}) if isinstance(listing, dict) else {}
         items = rows.get("accounts") or rows.get("items") or rows.get("list") or (
             listing.get("accounts") if isinstance(listing, dict) else None
         ) or []
-        acct_id = ""
         for it in items:
             if str(it.get("name") or "").lower() == email.lower() or str(it.get("email") or "").lower() == email.lower():
                 acct_id = str(it.get("id") or "")
                 break
         if not acct_id and items:
             acct_id = str(items[0].get("id") or "")
-        if acct_id:
+        if acct_id and group_id:
             client.move_openai_account_to_group(acct_id, group_id)
             log(f"  bound {email} -> group {group_id} (acct {acct_id})")
-        else:
+        elif not acct_id:
             log(f"  WARN 未能定位账号做绑组: {email}")
     except Exception as exc:  # noqa: BLE001
         log(f"  WARN 绑组失败 {email}: {str(exc)[:120]}")
+    return acct_id
 
 
 def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> dict:
@@ -134,15 +132,16 @@ def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> d
     email = res.get("email", "") or mail.email
     at = res.get("access_token", "")
     if not at:
+        svc.report_result("failed", reason="no_access_token (注册未到达 chatgpt.com)")
         return {"ok": False, "stage": "browser", "email": email, "reason": "no_access_token"}
     if not res.get("workspace_joined"):
-        # join 失败：账号在个人空间，没拿到 k12 套餐 —— 不导入，标为失败（号已废：outlook 已用）
+        svc.report_result("failed", reason="workspace_join_failed")
         return {"ok": False, "stage": "join", "email": email, "reason": "workspace_join_failed"}
     if not res.get("workspace_scoped"):
         # token 非 k12-scoped（切换失败）：导进去必 401 变废号。跳过导入。
+        svc.report_result("failed", reason="workspace_switch_failed: token 非 k12-scoped")
         return {"ok": False, "stage": "switch", "email": email,
-                "reason": "workspace_switch_failed: token 非 k12-scoped, 跳过导入避免 401",
-                "account_id": res.get("chatgpt_account_id", "")}
+                "reason": "workspace_switch_failed", "account_id": res.get("chatgpt_account_id", "")}
 
     payload = build_cpa_payload(
         email, at, res.get("chatgpt_account_id") or WORKSPACE_ID,
@@ -151,22 +150,24 @@ def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> d
     try:
         client.import_account_data(payload)
     except Exception as exc:  # noqa: BLE001
+        svc.report_result("failed", reason=f"import_failed: {str(exc)[:150]}")
         return {"ok": False, "stage": "import", "email": email, "error": str(exc)[:200]}
-    _bind_group(client, email, group_id)
-    return {"ok": True, "stage": "imported", "email": email, "workspace": WORKSPACE_ID}
+    acct_id = _bind_group(client, email, group_id)
+    svc.report_result("success", sub2api_account_id=acct_id, workspace_id=WORKSPACE_ID)
+    return {"ok": True, "stage": "imported", "email": email, "workspace": WORKSPACE_ID, "sub2api_id": acct_id}
 
 
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
     svc = OutlookEmailService()
-    used = svc._load_used()
-    avail = sum(1 for e, a in svc._accounts.items() if a.bootstrapped and e not in used)
+    avail = svc.available_for_lease()
+    log(f"mail source: {'pool ' + os.getenv('OUTLOOK_POOL_URL', '') if svc.pool_mode else 'local accounts.txt'}")
     if avail == 0:
-        log("==== 无可用 Outlook 账号(未 bootstrap / 均已使用 / 本 job 分片为空), 跳过 ====")
+        log("==== 无可用 Outlook 账号(池空 / 未 bootstrap / 均已使用), 跳过 ====")
         return
     if avail < count:
-        log(f"Outlook 池仅 {avail} 个可用, count {count}->{avail}")
+        log(f"可用 {avail} 个, count {count}->{avail}")
         count = avail
 
     client = Sub2ApiClient()
@@ -196,6 +197,13 @@ def main():
             r = run_one(client, svc, group_id)
         except Exception as exc:  # noqa: BLE001
             r = {"ok": False, "stage": "exception", "error": str(exc)}
+            try:
+                svc.report_result("failed", reason=f"exception: {str(exc)[:150]}")
+            except Exception:  # noqa: BLE001
+                pass
+            if "池已空" in str(exc) or "available=0" in str(exc):
+                log("==== 池已空, 收尾 ====")
+                break
         durations.append(time.monotonic() - t0)
         log(f"result: {r}")
         if r.get("ok"):
