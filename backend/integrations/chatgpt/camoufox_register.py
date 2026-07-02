@@ -270,6 +270,58 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
     return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
 
 
+def _select_auth_workspace(page, workspace_id, log, *, timeout=30) -> bool:
+    """On auth.openai.com/workspace (already-registered accounts land here after email OTP),
+    pick a workspace so the flow continues to chatgpt.com. Clicking an entry lets the SPA
+    POST /api/accounts/workspace/select + navigate itself; which entry we pick doesn't matter
+    since the downstream exchange-switch re-scopes the token to workspace_id anyway.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            low = (page.url or "").lower()
+        except Exception:  # noqa: BLE001
+            low = ""
+        if "/workspace" not in low:
+            return True
+        picked = False
+        for sel in ['text=/schools\\.nyc\\.gov/i', 'text=/workspace #\\d/i',
+                    '[data-testid*="workspace"]', 'button:has-text("Workspace")',
+                    'a:has-text("Workspace")']:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    _robust_click(page, el, log, "ws-select")
+                    log(f"[ws-select] 点击 workspace 条目: {sel}")
+                    picked = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if not picked and workspace_id:
+            # 兜底：直接 POST 选定 workspace_id，再手动导航到 chatgpt.com
+            try:
+                page.evaluate(
+                    """async (ws) => { try { await fetch('/api/accounts/workspace/select',
+                        {method:'POST', credentials:'include',
+                         headers:{'content-type':'application/json','accept':'application/json'},
+                         body: JSON.stringify({workspace_id: ws})}); } catch(e){} }""",
+                    workspace_id,
+                )
+                log("[ws-select] POST /api/accounts/workspace/select (兜底)")
+                time.sleep(2)
+                try:
+                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000)
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(3)
+    try:
+        return "/workspace" not in (page.url or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "") -> dict:
     """
     用真实浏览器走注册流程。
@@ -621,6 +673,18 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 except Exception:
                     pass
 
+            # [5.5] 已注册账号：邮箱 OTP 后落到 /workspace 选择页（非新号的 /about-you）。
+            #        选 workspace 继续到 chatgpt.com，并标记"已是成员"以跳过后面的 join。
+            time.sleep(3)
+            try:
+                _url_now = page.url or ""
+            except Exception:  # noqa: BLE001
+                _url_now = ""
+            if "/workspace" in _url_now.lower():
+                logger.info(f"[browser-reg] 命中 workspace 选择页(已注册账号): {_url_now[:80]}")
+                _select_auth_workspace(page, join_workspace_id or "", logger.info)
+                result["via_workspace_select"] = True
+
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
             time.sleep(5)  # 等重定向到 /about-you
@@ -853,10 +917,14 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
             # [9.5] 可选：申请加入母号 workspace（session/CPA 模型靠这拿到 k12 套餐）。
             #        浏览器内执行以过 Cloudflare；join 后重取 session（AT 可能刷新）。
             if join_workspace_id:
-                joined = _join_workspace(
-                    page, join_workspace_id, result["access_token"], result["device_id"], logger.info
-                )
-                result["workspace_joined"] = joined
+                if result.get("via_workspace_select"):
+                    # 已注册账号走了 /workspace 选择页 → 已是该 workspace 成员，不用再申请加入
+                    result["workspace_joined"] = True
+                    logger.info("[browser-reg] 已注册账号(已是成员), 跳过 join")
+                else:
+                    result["workspace_joined"] = _join_workspace(
+                        page, join_workspace_id, result["access_token"], result["device_id"], logger.info
+                    )
                 # step 5：切到 k12 workspace 并取 k12-scoped token（个人空间 token 会被 Codex 端 401）
                 scoped = _switch_workspace_and_get_token(
                     page, join_workspace_id, result["access_token"], logger.info

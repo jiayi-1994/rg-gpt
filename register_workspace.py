@@ -95,9 +95,8 @@ def build_cpa_payload(email: str, access_token: str, workspace_id: str, *,
     }
 
 
-def _bind_group(client: Sub2ApiClient, email: str, group_id: int) -> str:
-    """Find the just-imported account by email, move it to the sold group, return its id."""
-    acct_id = ""
+def _find_account_id(client: Sub2ApiClient, email: str) -> str:
+    """Look up an existing sub2api OpenAI account id by email, or '' if none."""
     try:
         listing = client.list_accounts(platform="openai", search=email, page_size=5)
         rows = (listing.get("data") or {}) if isinstance(listing, dict) else {}
@@ -106,18 +105,21 @@ def _bind_group(client: Sub2ApiClient, email: str, group_id: int) -> str:
         ) or []
         for it in items:
             if str(it.get("name") or "").lower() == email.lower() or str(it.get("email") or "").lower() == email.lower():
-                acct_id = str(it.get("id") or "")
-                break
-        if not acct_id and items:
-            acct_id = str(items[0].get("id") or "")
-        if acct_id and group_id:
+                return str(it.get("id") or "")
+        if items:
+            return str(items[0].get("id") or "")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARN 查账号失败 {email}: {str(exc)[:120]}")
+    return ""
+
+
+def _bind_group(client: Sub2ApiClient, acct_id: str, email: str, group_id: int) -> None:
+    if acct_id and group_id:
+        try:
             client.move_openai_account_to_group(acct_id, group_id)
             log(f"  bound {email} -> group {group_id} (acct {acct_id})")
-        elif not acct_id:
-            log(f"  WARN 未能定位账号做绑组: {email}")
-    except Exception as exc:  # noqa: BLE001
-        log(f"  WARN 绑组失败 {email}: {str(exc)[:120]}")
-    return acct_id
+        except Exception as exc:  # noqa: BLE001
+            log(f"  WARN 绑组失败 {email}: {str(exc)[:120]}")
 
 
 def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> dict:
@@ -147,14 +149,21 @@ def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> d
         email, at, res.get("chatgpt_account_id") or WORKSPACE_ID,
         id_token=res.get("id_token", ""), concurrency=client.account_concurrency,
     )
+    creds = payload["accounts"][0]["credentials"]
+    existing_id = _find_account_id(client, email)  # 续期识别：已存在则更新, 否则新导入(避免重复号)
     try:
-        client.import_account_data(payload)
+        if existing_id:
+            client.update_openai_account(existing_id, {"credentials": creds})
+            acct_id, stage = existing_id, "renewed"
+        else:
+            client.import_account_data(payload)
+            acct_id, stage = _find_account_id(client, email), "imported"
     except Exception as exc:  # noqa: BLE001
-        svc.report_result("failed", reason=f"import_failed: {str(exc)[:150]}")
+        svc.report_result("failed", reason=f"{'update' if existing_id else 'import'}_failed: {str(exc)[:140]}")
         return {"ok": False, "stage": "import", "email": email, "error": str(exc)[:200]}
-    acct_id = _bind_group(client, email, group_id)
+    _bind_group(client, acct_id, email, group_id)
     svc.report_result("success", sub2api_account_id=acct_id, workspace_id=WORKSPACE_ID)
-    return {"ok": True, "stage": "imported", "email": email, "workspace": WORKSPACE_ID, "sub2api_id": acct_id}
+    return {"ok": True, "stage": stage, "email": email, "workspace": WORKSPACE_ID, "sub2api_id": acct_id}
 
 
 def main():
