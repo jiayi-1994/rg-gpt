@@ -14,15 +14,15 @@ on:
       count_per_job:
         description: "accounts to register per job"
         required: false
-        default: "2"
+        default: "5"
       domains:
         description: "CloudMail domains, comma-separated (jobs spread across them; OpenAI caps ~20/domain)"
         required: false
-        default: "jiayi.dpdns.org,jiayi.ggff.net,edu.jiayi.ggff.net,xjy.hidns.vip,edu.xjy.hidns.vip,sub.xjy.hidns.vip,sub1.xjy.hidns.vip,sub2.xjy.hidns.vip,sub3.xjy.hidns.vip,sub4.xjy.hidns.vip,sub5.xjy.hidns.vip,sub6.xjy.hidns.vip,sub7.xjy.hidns.vip,sub8.xjy.hidns.vip,sub9.xjy.hidns.vip,sub10.xjy.hidns.vip,sub11.xjy.hidns.vip,sub12.xjy.hidns.vip,sub13.xjy.hidns.vip,sub14.xjy.hidns.vip,sub15.xjy.hidns.vip,sub16.xjy.hidns.vip,sub17.xjy.hidns.vip,sub18.xjy.hidns.vip,sub19.xjy.hidns.vip,sub20.xjy.hidns.vip"
+        default: "sub.xjy.hidns.vip,sub1.xjy.hidns.vip,sub2.xjy.hidns.vip,sub3.xjy.hidns.vip,sub4.xjy.hidns.vip,sub5.xjy.hidns.vip,sub6.xjy.hidns.vip,sub7.xjy.hidns.vip,sub8.xjy.hidns.vip,sub9.xjy.hidns.vip,sub10.xjy.hidns.vip"
       threshold:
         description: "只有活跃账号数低于此值才注册(维持目标池大小)"
         required: false
-        default: "200"
+        default: "400"
 
 jobs:
   # 先查活号数：>= threshold 就不跑注册矩阵，cron 自我调节、不过量注册。
