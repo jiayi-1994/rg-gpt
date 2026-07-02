@@ -73,9 +73,19 @@ MAIL_PROVIDER=outlook WORKSPACE_ID=631e1603-06cf-4f0b-b79b-d09fbfcfe98d \
 
 Flow: claim Outlook mailbox → Camoufox signs up ChatGPT (OTP from Outlook) → in the
 same browser `POST /backend-api/accounts/{WORKSPACE_ID}/invites/request` (join, runs
-in-browser to pass Cloudflare) → re-read `/api/auth/session` → import a CPA account
-(`credentials.access_token` + `chatgpt_account_id=WORKSPACE_ID`, no refresh_token) via
-`POST /api/v1/admin/accounts/data`.
+in-browser to pass Cloudflare) → **switch to the k12 workspace** via
+`GET /api/auth/session?exchange_workspace_token=true&workspace_id={WORKSPACE_ID}&reason=setCurrentAccount`
+(the token-exchange the ChatGPT UI uses) so the session token becomes k12-scoped →
+import a CPA account (`credentials.access_token` k12-scoped + `chatgpt_account_id=WORKSPACE_ID`,
+no refresh_token) via `POST /api/v1/admin/accounts/data`.
+
+A **JWT-scope gate** verifies the token's `chatgpt_account_id` claim equals `WORKSPACE_ID`
+before importing — a personal-scoped token (which the Codex backend `chatgpt.com/backend-api/
+codex/responses` rejects with `401 {"detail":"Unauthorized"}`) is never imported. Validated
+live: an imported account came up `status=active` with JWT `plan_type=k12`.
+
+**Reliability:** signup is ~80% reliable on a bare/datacenter IP (Turnstile + flaky steps);
+set `VERIFY_PROXY` to a residential proxy for dependable runs (the CI path already does).
 
 - sub2api **ignores `session_token`** and stores no cookie, so there is no durable
   credential here — the account is pinned to the access_token expiry and **auto-pauses**
