@@ -501,29 +501,35 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                          page.query_selector('input[name="code"]') or \
                          page.query_selector('input[inputmode="numeric"]:not([maxlength="1"])')
                 if single:
-                    single.click()
+                    _robust_click(page, single, logger.info, "otp-input")
                     time.sleep(0.3)
-                    single.fill(otp_code)
+                    _robust_fill(single, otp_code)
                     otp_filled = True
                 else:
                     digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
                              page.query_selector_all('input[maxlength="1"]')
                     if len(digits) >= 6:
                         for i, ch in enumerate(otp_code[:6]):
-                            digits[i].click()
+                            try:
+                                digits[i].click(timeout=4000)
+                            except Exception:
+                                try:
+                                    digits[i].evaluate("el => el.focus()")
+                                except Exception:
+                                    pass
                             time.sleep(0.1)
-                            digits[i].fill(ch)
+                            _robust_fill(digits[i], ch)
                         otp_filled = True
                 if not otp_filled:
                     page.screenshot(path="/tmp/browser_reg_otp_fail.png")
                     raise RuntimeError("OTP 输入框未找到")
                 time.sleep(0.8)
-                # Continue
+                # Continue（robust：短超时 + force + JS + 回车兜底，避免默认 30s click 卡死）
                 for sel in ['button[type="submit"]', 'button:has-text("Continue")',
                             'button:has-text("Verify")', 'button:has-text("Next")']:
                     b = page.query_selector(sel)
                     if b and b.is_visible():
-                        b.click()
+                        _robust_click(page, b, logger.info, "otp")
                         logger.info(f"[browser-reg] 点击 OTP 继续: {sel}")
                         break
                 time.sleep(4)
@@ -808,8 +814,14 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                         f"[browser-reg] codex 授权未拿到 code (add_phone={result['add_phone']})"
                     )
 
-            if not result["access_token"] or not result["session_token"]:
-                page.screenshot(path="/tmp/browser_reg_missing_token.png")
+            # CPA/session 导入只需要 access_token（sub2api 忽略 session_token）；
+            # 仅在非 join 流程(需要 session cookie 的老路径)才强制要求 session_token。
+            need_session_token = not join_workspace_id
+            if not result["access_token"] or (need_session_token and not result["session_token"]):
+                try:
+                    page.screenshot(path="/tmp/browser_reg_missing_token.png")
+                except Exception:
+                    pass
                 raise RuntimeError(
                     f"缺少凭证: access_token={bool(result['access_token'])} "
                     f"session_token={bool(result['session_token'])}"

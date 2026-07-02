@@ -37,7 +37,13 @@ from backend.integrations.chatgpt.camoufox_register import browser_register
 from backend.integrations.mail.outlook import OutlookEmailService
 from backend.integrations.sub2api import Sub2ApiClient
 
-log = logging.getLogger("workspace-runner")
+_logger = logging.getLogger("workspace-runner")
+
+
+def log(msg):
+    _logger.info(msg)
+
+
 PROXY = os.getenv("VERIFY_PROXY", "").strip()
 WORKSPACE_ID = os.getenv("WORKSPACE_ID", "631e1603-06cf-4f0b-b79b-d09fbfcfe98d").strip()  # k12
 
