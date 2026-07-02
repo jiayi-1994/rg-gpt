@@ -138,9 +138,14 @@ def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> d
     if not res.get("workspace_joined"):
         # join 失败：账号在个人空间，没拿到 k12 套餐 —— 不导入，标为失败（号已废：outlook 已用）
         return {"ok": False, "stage": "join", "email": email, "reason": "workspace_join_failed"}
+    if not res.get("workspace_scoped"):
+        # token 非 k12-scoped（切换失败）：导进去必 401 变废号。跳过导入。
+        return {"ok": False, "stage": "switch", "email": email,
+                "reason": "workspace_switch_failed: token 非 k12-scoped, 跳过导入避免 401",
+                "account_id": res.get("chatgpt_account_id", "")}
 
     payload = build_cpa_payload(
-        email, at, WORKSPACE_ID,
+        email, at, res.get("chatgpt_account_id") or WORKSPACE_ID,
         id_token=res.get("id_token", ""), concurrency=client.account_concurrency,
     )
     try:

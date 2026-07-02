@@ -199,6 +199,147 @@ def _join_workspace(page, workspace_id, access_token, device_id, log, *, route="
     return False
 
 
+def _jwt_account_id(access_token: str) -> str:
+    """Decode the chatgpt_account_id claim from a ChatGPT /api/auth/session JWT."""
+    try:
+        seg = access_token.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        claims = json.loads(__import__("base64").urlsafe_b64decode(seg))
+        return str((claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fetch_session(page):
+    try:
+        return page.evaluate(
+            """async () => { try { const r = await fetch('/api/auth/session', {credentials:'include'});
+                return await r.json(); } catch(e){ return null; } }"""
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _account_menu_dump(page) -> list[str]:
+    """List visible menu/button texts, for diagnosing the workspace switcher DOM."""
+    try:
+        return page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                'button, [role="menuitem"], [role="menuitemradio"], [role="option"], a[href], li[tabindex], div[role="button"]'))
+                .filter(e => { const r=e.getBoundingClientRect(); return r.width>0 && r.height>0; })
+                .map(e => (e.getAttribute('role')||e.tagName) + ':' + (e.getAttribute('data-testid')||'') + '|' + (e.innerText||'').slice(0,45).replace(/\\n/g,' '))
+                .filter(t => t.length > 2).slice(0, 80)"""
+        ) or []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, timeout=50) -> dict:
+    """Reload, switch active ChatGPT workspace to workspace_id, return a workspace-scoped
+    {access_token, id_token, account_id}. Verified via the token's chatgpt_account_id claim.
+    """
+    try:
+        page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(5)
+
+    # 目标 workspace 的显示名（用于在菜单里定位条目）
+    ws_name = ""
+    try:
+        accts = page.evaluate(
+            """async (at) => { try {
+                const r = await fetch('/backend-api/accounts/check/v4-2023-04-27',
+                    {credentials:'include', headers:{authorization:'Bearer '+at}});
+                return await r.json();
+            } catch(e){ return null; } }""",
+            access_token,
+        )
+        items = ((accts or {}).get("accounts") or {})
+        seq = list(items.values()) if isinstance(items, dict) else (items if isinstance(items, list) else [])
+        for it in seq:
+            a = (it or {}).get("account") or it or {}
+            aid = str(a.get("account_id") or a.get("id") or "")
+            if aid == workspace_id:
+                ws_name = str(a.get("name") or a.get("structure") or "")
+                break
+        log(f"[switch] target ws name={ws_name!r} (found {len(seq)} accounts)")
+    except Exception as e:  # noqa: BLE001
+        log(f"[switch] account list err: {str(e)[:80]}")
+
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        sess = _fetch_session(page)
+        at = (sess or {}).get("accessToken") or ""
+        if at and _jwt_account_id(at) == workspace_id:
+            log(f"[switch] ✓ token scoped to k12 (attempt {attempt})")
+            return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": workspace_id}
+        attempt += 1
+        _open_account_menu_and_pick(page, ws_name, log, dump=(attempt == 1))
+        time.sleep(4)
+
+    sess = _fetch_session(page)
+    at = (sess or {}).get("accessToken") or access_token
+    got = _jwt_account_id(at)
+    log(f"[switch] ✗ timeout, token account_id={got or '?'} (wanted {workspace_id[:8]})")
+    return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
+
+
+def _click_first_visible(page, selectors, log, label) -> bool:
+    for sel in selectors:
+        if not sel:
+            continue
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                try:
+                    el.hover(timeout=1500)
+                except Exception:  # noqa: BLE001
+                    pass
+                _robust_click(page, el, log, label)
+                log(f"[switch] {label}: {sel}")
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _open_account_menu_and_pick(page, ws_name, log, *, dump=False) -> None:
+    # 1) 打开底部 profile/账号菜单
+    opened = _click_first_visible(page, [
+        '[data-testid="accounts-profile-button"]',
+        'button[data-testid="profile-button"]',
+        'button[aria-label*="ccount"]', 'button[aria-label*="rofile"]',
+    ], log, "打开账号菜单")
+    if not opened:
+        log("[switch] 未打开账号菜单(选择器未命中)")
+    time.sleep(1.2)
+
+    # 2) 点当前账号行展开工作空间切换器（k12 在这个子菜单里，profile 菜单本身没有）
+    _click_first_visible(page, [
+        ':text("Personal account")', ':text("个人账户")', ':text("个人帐户")',
+        'text=/workspace #\\d/i', (f':text("{ws_name[:20]}")' if ws_name else None),
+    ], log, "展开切换器")
+    time.sleep(1.3)
+
+    if dump:
+        log("[switch] MENU DOM(post-expand): " + " || ".join(_account_menu_dump(page)))
+        try:
+            page.screenshot(path="/tmp/switch_menu.png")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 3) 点 k12 workspace 条目
+    picked = _click_first_visible(page, [
+        (f'text="{ws_name}"' if ws_name else None),
+        (f':text("{ws_name[:24]}")' if ws_name else None),
+        'text=/schools\\.nyc\\.gov/i', 'text=/workspace #82254/i', ':text("EDU")',
+    ], log, "点击 workspace")
+    if not picked:
+        log("[switch] 未找到 workspace 菜单条目")
+
+
 def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "") -> dict:
     """
     用真实浏览器走注册流程。
@@ -594,7 +735,16 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 if meta.get("type") == "date":
                     return True
                 return any(kw in blob for kw in ("birth", "birthday", "dob",
-                                                  "mm/dd/yyyy", "mm / dd / yyyy"))
+                                                  "mm/dd/yyyy", "mm / dd / yyyy",
+                                                  "year of birth", "year"))
+
+            def _is_year_of_birth(meta: dict) -> bool:
+                # 新版 (2026-07) "What year were you born?" 只要 4 位年份，不是完整日期
+                blob = " ".join([meta.get("name",""), meta.get("placeholder",""),
+                                  meta.get("ariaLabel",""), meta.get("label","")]).lower()
+                if meta.get("type") == "date":
+                    return False
+                return "year of birth" in blob or ("year" in blob and "birth" in blob)
 
             full_name_input = None
             birthday_input = None
@@ -643,13 +793,16 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 mm, dd = "01", "15"
                 # native date input 用 YYYY-MM-DD，文本框大多是 MM/DD/YYYY
                 bd_type = (birthday_meta or {}).get("type", "")
+                bd_is_year = _is_year_of_birth(birthday_meta or {})
                 if bd_type == "date":
                     birthday_str = f"{year}-{mm}-{dd}"
+                elif bd_is_year:
+                    birthday_str = str(year)          # "Year of birth" 只要年份
                 else:
                     birthday_str = f"{mm}/{dd}/{year}"
                 legacy_age = str(random.randint(26, 40))
                 logger.info(f"[browser-reg] 填 Full name={full_name}  "
-                            f"Birthday={birthday_str} (legacy_age={legacy_age})")
+                            f"Birthday={birthday_str} (year_field={bd_is_year} legacy_age={legacy_age})")
                 try:
                     full_name_input.focus(); time.sleep(0.3)
                     page.keyboard.type(full_name, delay=random.randint(30, 80))
@@ -668,8 +821,8 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                         except Exception:
                             page.keyboard.type(birthday_str, delay=random.randint(30, 70))
                     else:
-                        # MM/DD/YYYY：为兼容 age 老版，若看起来是 number/age 就只打 age
-                        if _is_birthday(birthday_meta or {}):
+                        # year-of-birth 只打年份；MM/DD/YYYY birthday 打整串；否则老版 age 数字
+                        if bd_is_year or _is_birthday(birthday_meta or {}):
                             page.keyboard.type(birthday_str, delay=random.randint(30, 70))
                         else:
                             page.keyboard.type(legacy_age, delay=random.randint(40, 100))
@@ -774,17 +927,19 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                     page, join_workspace_id, result["access_token"], result["device_id"], logger.info
                 )
                 result["workspace_joined"] = joined
-                result["chatgpt_account_id"] = join_workspace_id  # sub2api 靠它发 chatgpt-account-id 头选 workspace
-                try:
-                    s2 = page.evaluate(
-                        """async () => { const r = await fetch("/api/auth/session", {credentials:"include"});
-                            return await r.json(); }"""
-                    )
-                    if isinstance(s2, dict) and s2.get("accessToken"):
-                        result["access_token"] = s2.get("accessToken") or result["access_token"]
-                        result["id_token"] = s2.get("idToken", "") or result["id_token"]
-                except Exception:  # noqa: BLE001
-                    pass
+                # step 5：切到 k12 workspace 并取 k12-scoped token（个人空间 token 会被 Codex 端 401）
+                scoped = _switch_workspace_and_get_token(
+                    page, join_workspace_id, result["access_token"], logger.info
+                )
+                if scoped.get("access_token"):
+                    result["access_token"] = scoped["access_token"]
+                    result["id_token"] = scoped.get("id_token") or result["id_token"]
+                result["chatgpt_account_id"] = scoped.get("account_id") or ""
+                result["workspace_scoped"] = (scoped.get("account_id") == join_workspace_id)
+                logger.info(
+                    f"[browser-reg] workspace_scoped={result['workspace_scoped']} "
+                    f"account_id={result['chatgpt_account_id'][:8]}"
+                )
 
             # [10] 可选：同会话跑 codex 授权拿 refresh_token（复刻 sub2api OAuth 添加账号）
             if oauth_session is not None:
