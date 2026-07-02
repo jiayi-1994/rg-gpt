@@ -1,4 +1,8 @@
-camoufox[geoip]>=0.4.0
+# Pinned: newer playwright sends viewport.isMobile which the camoufox 0.4.11
+# browser's juggler rejects ("not described in this scheme"), crashing launch on
+# CI. Keep camoufox + playwright at the locally-verified working pair.
+camoufox[geoip]==0.4.11
+playwright==1.61.0
 browserforge>=1.2.0
 curl_cffi>=0.15.0
 requests>=2.31.0
