@@ -202,6 +202,7 @@ def imap_read_messages(email: str, access_token: str, *, per_folder: int = 20) -
                     "text": text_body,
                     "html": html_body,
                     "sender": from_addr,
+                    "recipients": _msg_recipients(msg),
                     "received_at": _parse_dt(msg.get("Date")),
                 })
     finally:
@@ -380,6 +381,7 @@ class OutlookEmailService:
         self.pool_mode = bool(self._pool_url and self._pool_key)
         self._pool = _PoolClient(self._pool_url, self._pool_key) if self.pool_mode else None
         self._leased: dict[str, Any] | None = None
+        self._base_token: dict[str, tuple[str, float]] = {}  # base_email -> (access_token, expiry)
         self._accounts: dict[str, OutlookAccount] = (
             {} if self.pool_mode else {a.email: a for a in _partition_for_job(load_accounts())}
         )
@@ -465,6 +467,7 @@ class OutlookEmailService:
         if acct is None or not acct.bootstrapped:
             logger.warning("[Outlook] no bootstrapped account for %s", target)
             return None
+        base = _base_email(target)  # +tag aliases share one physical mailbox
 
         since = _since_datetime(otp_sent_at)
         if since is not None:
@@ -475,13 +478,17 @@ class OutlookEmailService:
         deadline = time.time() + max(1, int(timeout or 300))
         while time.time() < deadline:
             try:
-                token = acct.access_token()
-                mails = imap_read_messages(target, token)
+                token = self._base_access_token(acct, base)
+                mails = imap_read_messages(base, token)
             except OutlookAuthError as exc:
-                logger.warning("[Outlook] read error for %s: %s", target, exc)
+                logger.warning("[Outlook] read error for %s: %s", base, exc)
                 time.sleep(self._poll_interval)
                 continue
             for mail in mails:
+                # 收件人过滤：多个 +N 别名共用一个信箱，只认 To/Cc == 本别名的邮件（并发安全）。
+                recips = mail.get("recipients") or set()
+                if recips and target not in recips:
+                    continue
                 if since is not None and mail["received_at"] is not None and mail["received_at"] < since:
                     continue
                 haystack = "\n".join(
@@ -491,11 +498,25 @@ class OutlookEmailService:
                     continue
                 code = _extract_otp(haystack, code_pattern)
                 if code and code not in excluded:
-                    logger.info("[Outlook] OTP for %s: %s (from %s/%s)",
-                                target, code, mail["sender"], mail["folder"])
+                    logger.info("[Outlook] OTP for %s: %s (from %s/%s, to=%s)",
+                                target, code, mail["sender"], mail["folder"], ",".join(sorted(recips))[:60])
                     return code
             time.sleep(self._poll_interval)
         return None
+
+    def _base_access_token(self, acct: "OutlookAccount", base: str) -> str:
+        """Access token for the physical (base) mailbox, cached per base so N +tag
+        aliases don't each refresh (and rotate) the shared refresh_token."""
+        cached = self._base_token.get(base)
+        if cached and time.time() < cached[1] - ACCESS_TOKEN_SKEW_SECONDS:
+            return cached[0]
+        tok = refresh_access_token(acct.refresh_token, client_id=acct.client_id)
+        at = str(tok["access_token"])
+        self._base_token[base] = (at, time.time() + float(tok.get("expires_in") or 3600))
+        new_rt = tok.get("refresh_token")
+        if new_rt:
+            acct.refresh_token = new_rt
+        return at
 
     # -- pool claim --------------------------------------------------------
 
@@ -617,6 +638,24 @@ def _parse_message(msg: Any) -> tuple[str, str, str, str]:
         else:
             text_body = decoded
     return subject, text_body, html_body, from_addr
+
+
+def _base_email(email: str) -> str:
+    """Strip a +tag sub-address: user+2@outlook.com -> user@outlook.com."""
+    local, sep, domain = str(email or "").strip().partition("@")
+    if not sep:
+        return str(email or "").strip().lower()
+    return f"{local.split('+', 1)[0]}@{domain}".lower()
+
+
+def _msg_recipients(msg: Any) -> set[str]:
+    """Lowercased To+Cc addresses. These preserve the +tag for plus-addressed mail
+    (Delivered-To is always the base mailbox, so it is deliberately excluded)."""
+    from email.utils import getaddresses
+    vals: list[str] = []
+    for header in ("To", "Cc"):
+        vals.extend(msg.get_all(header, []) or [])
+    return {addr.strip().lower() for _, addr in getaddresses(vals) if addr and "@" in addr}
 
 
 def _html_to_text(value: Any) -> str:

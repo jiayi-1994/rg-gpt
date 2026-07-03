@@ -129,6 +129,20 @@ def parse_line(line: str) -> dict[str, str] | None:
     return {"email": email, "password": password, "client_id": client_id, "refresh_token": refresh_token}
 
 
+def _expand_plus(acct: dict[str, str], n: int = 5) -> list[dict[str, str]]:
+    """One base account -> base + user+1..user+n (plus-addressing). All share the
+    same password/client_id/refresh_token (same physical mailbox). Skips if already
+    a +tag alias."""
+    email = acct["email"]
+    local, sep, domain = email.partition("@")
+    if not sep or "+" in local:
+        return [acct]
+    out = [acct]
+    for i in range(1, max(0, n) + 1):
+        out.append({**acct, "email": f"{local}+{i}@{domain}"})
+    return out
+
+
 def _redact(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     rt = d.get("refresh_token") or ""
@@ -182,6 +196,11 @@ def add_accounts(payload: dict = Body(...)) -> dict[str, Any]:
     """Bulk add. Body: {"lines": "email----password----cid----rt\\n..."}."""
     lines = str(payload.get("lines") or "").splitlines()
     parsed = [p for p in (parse_line(ln) for ln in lines) if p]
+    # 加 1 个号 = 生成 base + 5 个 +N 别名(共 6)。可 {"expand": false} 关闭 / {"plus": N} 调数量。
+    expand = payload.get("expand", True)
+    n = int(payload.get("plus") or 5)
+    if expand:
+        parsed = [row for a in parsed for row in _expand_plus(a, n)]
     added, updated, skipped = 0, 0, 0
     with _tx() as conn:
         for a in parsed:
@@ -284,6 +303,31 @@ def reset_all() -> dict[str, Any]:
     return {"ok": True, "reset": int(n or 0)}
 
 
+@app.post("/api/expand-plus", dependencies=[Depends(require_key)])
+def expand_plus(payload: dict = Body(default={})) -> dict[str, Any]:
+    """Backfill +1..+n plus-addressing aliases for every existing base account
+    (same creds). Idempotent — skips aliases that already exist."""
+    n = int(payload.get("plus") or 5)
+    added = 0
+    with _tx() as conn:
+        rows = conn.execute("SELECT email,password,client_id,refresh_token FROM accounts WHERE instr(email,'+')=0").fetchall()
+        for r in rows:
+            local, sep, domain = r["email"].partition("@")
+            if not sep:
+                continue
+            for i in range(1, n + 1):
+                alias = f"{local}+{i}@{domain}"
+                if conn.execute("SELECT 1 FROM accounts WHERE email=?", (alias,)).fetchone():
+                    continue
+                conn.execute(
+                    "INSERT INTO accounts(email,password,client_id,refresh_token,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?, 'available', ?, ?)",
+                    (alias, r["password"], r["client_id"], r["refresh_token"], _now(), _now()),
+                )
+                added += 1
+    return {"ok": True, "added": added}
+
+
 @app.post("/api/accounts/{acct_id}/disable", dependencies=[Depends(require_key)])
 def disable(acct_id: int) -> dict[str, Any]:
     with _tx() as conn:
@@ -343,7 +387,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </header>
 <main>
   <div class="stats" id="stats"></div>
-  <div style="margin:0 0 12px"><button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button></div>
+  <div style="margin:0 0 12px;display:flex;gap:8px"><button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button><button class="chip" style="background:#6f42c1;color:#fff;border-color:#6f42c1;font-weight:600" onclick="expandPlus()">＋ 展开 +5 别名(现有号)</button></div>
   <details style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:600">➕ 批量添加账号</summary>
     <p class="muted">一行一个：<code>email----password----client_id----refresh_token</code>（字段顺序自动识别）</p>
     <textarea id="bulk" placeholder="foo@outlook.com----pw----9e5f94bc-...----M.C5..."></textarea>
@@ -396,6 +440,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  }
  async function act(id,what){await api(`/api/accounts/${id}/${what}`,{method:"POST"});refresh();}
  async function resetAll(){if(!confirm("把所有非停用账号重置为 available?"))return;const r=await api("/api/reset-all",{method:"POST"});$("#msg").textContent=`已重置 ${r.reset} 个`;refresh();}
+ async function expandPlus(){if(!confirm("给每个 base 号补 +1..+5 别名(共6)?"))return;const r=await api("/api/expand-plus",{method:"POST",body:JSON.stringify({plus:5})});$("#msg").textContent=`新增 ${r.added} 个别名`;refresh();}
  async function del(id){if(!confirm("删除 #"+id+"?"))return;await api(`/api/accounts/${id}`,{method:"DELETE"});refresh();}
  refresh();setInterval(refresh,8000);
 </script>
