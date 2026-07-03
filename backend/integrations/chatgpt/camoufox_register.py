@@ -272,38 +272,17 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
 
 def _select_auth_workspace(page, workspace_id, log, *, timeout=15) -> bool:
     """On auth.openai.com/workspace (already-registered accounts land here after email OTP),
-    pick a workspace so the flow continues to chatgpt.com.
+    select the target workspace so the flow continues to chatgpt.com.
 
-    Click the entry ONCE and let the SPA POST /api/accounts/workspace/select + navigate
-    itself — do NOT inject a page.goto while it navigates; that races the SPA and can crash
-    the Firefox driver on an uncaught pageError (pageError.location.url undefined). Which
-    entry we pick doesn't matter; the downstream exchange-switch re-scopes to workspace_id.
+    POST /api/accounts/workspace/select with the exact workspace_id (name-independent —
+    works for any workspace), then goto chatgpt.com. Deliberately does NOT click an SPA
+    entry: a click starts an SPA navigation that, if a goto races it, crashes the Firefox
+    driver on an uncaught pageError. No click => no racing navigation => safe goto.
     """
-    clicked = False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            low = (page.url or "").lower()
-        except Exception:  # noqa: BLE001
-            low = ""
-        if "/workspace" not in low:
-            return True  # SPA navigated off the select page — done
-        if not clicked:
-            for sel in ['text=/schools\\.nyc\\.gov/i', 'text=/workspace #\\d/i',
-                        '[data-testid*="workspace"]', 'button:has-text("Workspace")',
-                        'a:has-text("Workspace")']:
-                try:
-                    el = page.query_selector(sel)
-                    if el and el.is_visible():
-                        _robust_click(page, el, log, "ws-select")
-                        log(f"[ws-select] 点击 workspace 条目: {sel}")
-                        clicked = True
-                        break
-                except Exception:  # noqa: BLE001
-                    continue
-        time.sleep(2)  # 等 SPA 自己导航，不插 goto
-    # 仅点击彻底没生效时的兜底：POST 选定 workspace，绝不 goto（避免撞 SPA 导航崩 driver）
-    if workspace_id and "/workspace" in ((page.url or "").lower() if True else ""):
+    # 用精确 workspace_id 直接 POST 选定(不依赖条目名字, 换个 workspace 也不用改选择器),
+    # 再 goto chatgpt.com。不点击 SPA 条目 => 没有 SPA 导航在跑 => goto 不会撞崩 FF driver
+    # (之前崩的根因是"点击触发的 SPA 导航"与 goto 竞争)。
+    if workspace_id:
         try:
             page.evaluate(
                 """async (ws) => { try { await fetch('/api/accounts/workspace/select',
@@ -312,10 +291,20 @@ def _select_auth_workspace(page, workspace_id, log, *, timeout=15) -> bool:
                      body: JSON.stringify({workspace_id: ws})}); } catch(e){} }""",
                 workspace_id,
             )
-            log("[ws-select] POST /api/accounts/workspace/select 兜底(无 goto)")
-            time.sleep(5)
-        except Exception:  # noqa: BLE001
-            pass
+            log("[ws-select] POST workspace/select")
+        except Exception as e:  # noqa: BLE001
+            log(f"[ws-select] POST 失败: {str(e)[:60]}")
+        time.sleep(3)
+    deadline = time.time() + max(10, int(timeout))
+    while time.time() < deadline:
+        if "/workspace" not in (page.url or "").lower():
+            return True
+        try:
+            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=40000)
+            log("[ws-select] goto chatgpt.com")
+        except Exception as e:  # noqa: BLE001
+            log(f"[ws-select] goto: {str(e)[:60]}")
+        time.sleep(3)
     try:
         return "/workspace" not in (page.url or "").lower()
     except Exception:  # noqa: BLE001
