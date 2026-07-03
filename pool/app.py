@@ -271,6 +271,19 @@ def retry(acct_id: int) -> dict[str, Any]:
     return {"ok": True, "id": acct_id, "status": "available"}
 
 
+@app.post("/api/reset-all", dependencies=[Depends(require_key)])
+def reset_all() -> dict[str, Any]:
+    """Reset every non-disabled account back to available (bulk re-import after a wipe)."""
+    with _tx() as conn:
+        cur = conn.execute(
+            "UPDATE accounts SET status='available', reason='', lease_token='', updated_at=? "
+            "WHERE status NOT IN ('available','disabled')",
+            (_now(),),
+        )
+        n = cur.rowcount
+    return {"ok": True, "reset": int(n or 0)}
+
+
 @app.post("/api/accounts/{acct_id}/disable", dependencies=[Depends(require_key)])
 def disable(acct_id: int) -> dict[str, Any]:
     with _tx() as conn:
@@ -330,6 +343,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </header>
 <main>
   <div class="stats" id="stats"></div>
+  <div style="margin:0 0 12px"><button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button></div>
   <details style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:600">➕ 批量添加账号</summary>
     <p class="muted">一行一个：<code>email----password----client_id----refresh_token</code>（字段顺序自动识别）</p>
     <textarea id="bulk" placeholder="foo@outlook.com----pw----9e5f94bc-...----M.C5..."></textarea>
@@ -368,7 +382,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
        <td class="reason">${a.reason||""}</td>
        <td class="muted">${fmtTime(a.updated_at)}</td>
        <td>
-         ${(a.status==='failed'||a.status==='stale')?`<button onclick="act(${a.id},'retry')">重试</button>`:""}
+         ${a.status!=='available'?`<button onclick="act(${a.id},'retry')">重置</button>`:""}
          ${a.status!=='disabled'?`<button onclick="act(${a.id},'disable')">停用</button>`:""}
          <button class="danger" onclick="del(${a.id})">删</button>
        </td></tr>`).join("");
@@ -381,6 +395,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    $("#msg").textContent=`已添加 ${r.added}, 更新 ${r.updated}`;$("#bulk").value="";refresh();
  }
  async function act(id,what){await api(`/api/accounts/${id}/${what}`,{method:"POST"});refresh();}
+ async function resetAll(){if(!confirm("把所有非停用账号重置为 available?"))return;const r=await api("/api/reset-all",{method:"POST"});$("#msg").textContent=`已重置 ${r.reset} 个`;refresh();}
  async function del(id){if(!confirm("删除 #"+id+"?"))return;await api(`/api/accounts/${id}`,{method:"DELETE"});refresh();}
  refresh();setInterval(refresh,8000);
 </script>
