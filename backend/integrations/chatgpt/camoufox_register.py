@@ -178,11 +178,16 @@ def _join_workspace(page, workspace_id, access_token, device_id, log, *, route="
         except Exception as e:  # noqa: BLE001
             log(f"[join] evaluate 异常: {str(e)[:80]}")
             res = None
+        text = str((res or {}).get("text") or "")
         if res and res.get("ok"):
-            log(f"[join] ✓ {workspace_id[:8]} HTTP {res.get('status')}: {str(res.get('text'))[:120]}")
+            log(f"[join] ✓ {workspace_id[:8]} HTTP {res.get('status')}: {text[:120]}")
+            return True
+        # 幂等：已是成员 / 已申请 / 已有邀请 → 视作加入成功，继续切换导入
+        if res and re.search(r"already|member|pending|invited|exists", text, re.I):
+            log(f"[join] · {workspace_id[:8]} 已是成员/已申请 ({text[:80]})")
             return True
         code = (res or {}).get("status")
-        log(f"[join] ✗ {workspace_id[:8]} HTTP {code}: {str((res or {}).get('text'))[:150]}")
+        log(f"[join] ✗ {workspace_id[:8]} HTTP {code}: {text[:150]}")
         # 401/403 → 子号 AT 失效，重取 session 再试（同油猴逻辑）
         if code in (401, 403):
             try:
@@ -270,45 +275,41 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
     return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
 
 
-def _select_auth_workspace(page, workspace_id, log, *, timeout=15) -> bool:
-    """On auth.openai.com/workspace (already-registered accounts land here after email OTP),
-    select the target workspace so the flow continues to chatgpt.com.
+def _select_auth_workspace(page, log, *, timeout=25) -> bool:
+    """On auth.openai.com/workspace, select the PERSONAL account to reach chatgpt.com.
 
-    POST /api/accounts/workspace/select with the exact workspace_id (name-independent —
-    works for any workspace), then goto chatgpt.com. Deliberately does NOT click an SPA
-    entry: a click starts an SPA navigation that, if a goto races it, crashes the Firefox
-    driver on an uncaught pageError. No click => no racing navigation => safe goto.
+    Already-registered accounts land here and may belong to some *other* org (e.g. a
+    different school workspace), not the target — so selecting the target directly fails.
+    The Personal account ("个人帐户"/"Personal account") exists for every account and its
+    label is stable, so we click it to get into chatgpt.com; the target workspace is then
+    joined by the normal join+switch steps. Clicking lets the SPA navigate itself; we only
+    goto (a plain navigation) when no entry was clicked, so a goto never races an in-flight
+    SPA navigation (which was the earlier FF-driver crash).
     """
-    # 用精确 workspace_id 直接 POST 选定(不依赖条目名字, 换个 workspace 也不用改选择器),
-    # 再 goto chatgpt.com。不点击 SPA 条目 => 没有 SPA 导航在跑 => goto 不会撞崩 FF driver
-    # (之前崩的根因是"点击触发的 SPA 导航"与 goto 竞争)。
-    if workspace_id:
+    clicked = False
+    for sel in ['text=/personal account/i', ':text("个人帐户")', ':text("个人账户")']:
         try:
-            page.evaluate(
-                """async (ws) => { try { await fetch('/api/accounts/workspace/select',
-                    {method:'POST', credentials:'include',
-                     headers:{'content-type':'application/json','accept':'application/json'},
-                     body: JSON.stringify({workspace_id: ws})}); } catch(e){} }""",
-                workspace_id,
-            )
-            log("[ws-select] POST workspace/select")
-        except Exception as e:  # noqa: BLE001
-            log(f"[ws-select] POST 失败: {str(e)[:60]}")
-        time.sleep(3)
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                _robust_click(page, el, log, "personal")
+                log(f"[ws-select] 选个人账户: {sel}")
+                clicked = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
     deadline = time.time() + max(10, int(timeout))
     while time.time() < deadline:
         if "/workspace" not in (page.url or "").lower():
             return True
-        try:
-            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=40000)
-            log("[ws-select] goto chatgpt.com")
-        except Exception as e:  # noqa: BLE001
-            log(f"[ws-select] goto: {str(e)[:60]}")
-        time.sleep(3)
-    try:
-        return "/workspace" not in (page.url or "").lower()
-    except Exception:  # noqa: BLE001
-        return False
+        if not clicked:
+            # 没点到个人账户条目：直接 goto chatgpt.com(无点击 = 无 SPA 导航竞争, goto 安全)
+            try:
+                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=40000)
+                log("[ws-select] goto chatgpt.com(未见个人账户条目)")
+            except Exception as e:  # noqa: BLE001
+                log(f"[ws-select] goto: {str(e)[:60]}")
+        time.sleep(2)
+    return "/workspace" not in (page.url or "").lower()
 
 
 def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "") -> dict:
@@ -671,9 +672,9 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 except Exception:  # noqa: BLE001
                     _u = ""
                 if "/workspace" in _u:
-                    logger.info("[browser-reg] 命中 workspace 选择页(已注册账号)")
-                    _select_auth_workspace(page, join_workspace_id or "", logger.info)
-                    result["via_workspace_select"] = True
+                    logger.info("[browser-reg] 命中 workspace 选择页(已注册账号) → 选个人账户")
+                    _select_auth_workspace(page, logger.info)
+                    result["skip_about_you"] = True  # 已注册号无 about-you 表单; join 照常跑(加入目标 workspace)
                     break
                 if "about-you" in _u or ("chatgpt.com" in _u and "auth.openai.com" not in _u):
                     break
@@ -737,8 +738,8 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
             birthday_input = None
             birthday_meta = None
             for attempt in range(30):
-                if result.get("via_workspace_select"):
-                    break  # 已注册账号走了 workspace 选择, 没有 about-you 表单
+                if result.get("skip_about_you"):
+                    break  # 已注册账号走了个人账户, 没有 about-you 表单
                 metas = _enum_inputs()
                 visible_metas = [m for m in metas if m["visible"]
                                   and m["type"] not in ("hidden","submit","button",
@@ -912,14 +913,11 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
             # [9.5] 可选：申请加入母号 workspace（session/CPA 模型靠这拿到 k12 套餐）。
             #        浏览器内执行以过 Cloudflare；join 后重取 session（AT 可能刷新）。
             if join_workspace_id:
-                if result.get("via_workspace_select"):
-                    # 已注册账号走了 /workspace 选择页 → 已是该 workspace 成员，不用再申请加入
-                    result["workspace_joined"] = True
-                    logger.info("[browser-reg] 已注册账号(已是成员), 跳过 join")
-                else:
-                    result["workspace_joined"] = _join_workspace(
-                        page, join_workspace_id, result["access_token"], result["device_id"], logger.info
-                    )
+                # 总是申请加入目标 workspace(幂等：已是成员则视作成功)。已注册号从个人账户进来，
+                # 需要在这里真正加入目标 workspace，再切换取 scoped token。
+                result["workspace_joined"] = _join_workspace(
+                    page, join_workspace_id, result["access_token"], result["device_id"], logger.info
+                )
                 # step 5：切到 k12 workspace 并取 k12-scoped token（个人空间 token 会被 Codex 端 401）
                 scoped = _switch_workspace_and_get_token(
                     page, join_workspace_id, result["access_token"], logger.info
