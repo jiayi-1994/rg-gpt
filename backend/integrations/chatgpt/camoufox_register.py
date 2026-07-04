@@ -912,25 +912,33 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
 
             # [9.5] 可选：申请加入母号 workspace（session/CPA 模型靠这拿到 k12 套餐）。
             #        浏览器内执行以过 Cloudflare；join 后重取 session（AT 可能刷新）。
-            if join_workspace_id:
-                # 总是申请加入目标 workspace(幂等：已是成员则视作成功)。已注册号从个人账户进来，
-                # 需要在这里真正加入目标 workspace，再切换取 scoped token。
-                result["workspace_joined"] = _join_workspace(
-                    page, join_workspace_id, result["access_token"], result["device_id"], logger.info
-                )
-                # step 5：切到 k12 workspace 并取 k12-scoped token（个人空间 token 会被 Codex 端 401）
-                scoped = _switch_workspace_and_get_token(
-                    page, join_workspace_id, result["access_token"], logger.info
-                )
-                if scoped.get("access_token"):
-                    result["access_token"] = scoped["access_token"]
-                    result["id_token"] = scoped.get("id_token") or result["id_token"]
-                result["chatgpt_account_id"] = scoped.get("account_id") or ""
-                result["workspace_scoped"] = (scoped.get("account_id") == join_workspace_id)
-                logger.info(
-                    f"[browser-reg] workspace_scoped={result['workspace_scoped']} "
-                    f"account_id={result['chatgpt_account_id'][:8]}"
-                )
+            # join_workspace_id 支持逗号分隔多个 → 一个号加入多个 workspace，各取 scoped token
+            # (每个 workspace 后面导一个独立 sub2api 账号)。
+            ws_ids = [w.strip() for w in str(join_workspace_id or "").split(",") if w.strip()]
+            if ws_ids:
+                # 先幂等 join 所有 workspace（用当前/个人 AT），再逐个切换取 scoped token。
+                for ws in ws_ids:
+                    _join_workspace(page, ws, result["access_token"], result["device_id"], logger.info)
+                result["workspaces"] = {}
+                for ws in ws_ids:
+                    scoped = _switch_workspace_and_get_token(page, ws, result["access_token"], logger.info)
+                    ok = bool(scoped.get("access_token")) and scoped.get("account_id") == ws
+                    result["workspaces"][ws] = {
+                        "scoped": ok,
+                        "access_token": scoped.get("access_token", ""),
+                        "id_token": scoped.get("id_token", ""),
+                        "account_id": scoped.get("account_id", ""),
+                    }
+                    logger.info(f"[browser-reg] ws {ws[:8]}: scoped={ok}")
+                # 汇总：只要有一个 workspace 切成功就算 joined+scoped（供旧字段兼容）
+                any_ok = any(d["scoped"] for d in result["workspaces"].values())
+                result["workspace_joined"] = any_ok
+                result["workspace_scoped"] = any_ok
+                first = next((w for w, d in result["workspaces"].items() if d["scoped"]), "")
+                if first:
+                    result["chatgpt_account_id"] = first
+                logger.info(f"[browser-reg] workspaces scoped: "
+                            f"{sum(1 for d in result['workspaces'].values() if d['scoped'])}/{len(ws_ids)}")
 
             # [10] 可选：同会话跑 codex 授权拿 refresh_token（复刻 sub2api OAuth 添加账号）
             if oauth_session is not None:

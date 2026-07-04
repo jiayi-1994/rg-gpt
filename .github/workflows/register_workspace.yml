@@ -20,6 +20,10 @@ on:
         description: "which mailbox kind to lease from the pool: outlook | gmail"
         required: false
         default: "outlook"
+      workspace_id:
+        description: "target workspace id(s), comma-separated for multi (blank = WORKSPACE_ID secret)"
+        required: false
+        default: ""
 
 jobs:
   setup:
@@ -73,7 +77,7 @@ jobs:
           MAIL_KIND: ${{ github.event.inputs.mail_kind || 'outlook' }}
           OUTLOOK_POOL_URL: ${{ secrets.OUTLOOK_POOL_URL }}
           POOL_API_KEY: ${{ secrets.POOL_API_KEY }}
-          WORKSPACE_ID: ${{ secrets.WORKSPACE_ID }}
+          WORKSPACE_ID: ${{ github.event.inputs.workspace_id || secrets.WORKSPACE_ID }}
           SUB2API_URL: ${{ secrets.SUB2API_URL }}
           SUB2API_EMAIL: ${{ secrets.SUB2API_EMAIL }}
           SUB2API_PASSWORD: ${{ secrets.SUB2API_PASSWORD }}

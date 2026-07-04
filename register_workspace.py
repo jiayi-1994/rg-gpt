@@ -45,7 +45,7 @@ def log(msg):
 
 
 PROXY = os.getenv("VERIFY_PROXY", "").strip()
-WORKSPACE_ID = os.getenv("WORKSPACE_ID", "631e1603-06cf-4f0b-b79b-d09fbfcfe98d").strip()  # k12
+WORKSPACE_ID = os.getenv("WORKSPACE_ID", "ff598c4d-ccaf-40c1-bfaa-cb94565764b1,b49cd6d8-b52d-4c21-93d7-89cc19b5e18e,83bec9de-395a-44e6-9a30-189508c22b99").strip()  # k12
 
 
 class Cfg:
@@ -70,7 +70,7 @@ class MailAdapter:
 
 
 def build_cpa_payload(email: str, access_token: str, workspace_id: str, *,
-                      id_token: str = "", concurrency: int = 10) -> dict:
+                      name: str = "", id_token: str = "", concurrency: int = 10) -> dict:
     """sub2api account-data import body for one session/CPA OpenAI account."""
     creds = {
         "access_token": access_token,
@@ -85,7 +85,7 @@ def build_cpa_payload(email: str, access_token: str, workspace_id: str, *,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "proxies": [],
         "accounts": [{
-            "name": email,
+            "name": name or email,
             "platform": "openai",
             "type": "oauth",
             "credentials": creds,
@@ -136,34 +136,41 @@ def run_one(client: Sub2ApiClient, svc: OutlookEmailService, group_id: int) -> d
     if not at:
         svc.report_result("failed", reason="no_access_token (注册未到达 chatgpt.com)")
         return {"ok": False, "stage": "browser", "email": email, "reason": "no_access_token"}
-    if not res.get("workspace_joined"):
-        svc.report_result("failed", reason="workspace_join_failed")
-        return {"ok": False, "stage": "join", "email": email, "reason": "workspace_join_failed"}
-    if not res.get("workspace_scoped"):
-        # token 非 k12-scoped（切换失败）：导进去必 401 变废号。跳过导入。
-        svc.report_result("failed", reason="workspace_switch_failed: token 非 k12-scoped")
-        return {"ok": False, "stage": "switch", "email": email,
-                "reason": "workspace_switch_failed", "account_id": res.get("chatgpt_account_id", "")}
+    # 一个号可加入多个 workspace，每个切成功的 workspace 导一个独立 sub2api 账号。
+    scoped = {ws: d for ws, d in (res.get("workspaces") or {}).items()
+              if d.get("scoped") and d.get("access_token")}
+    if not scoped:
+        svc.report_result("failed", reason="no workspace scoped (join/switch 全失败, 导入会 401)")
+        return {"ok": False, "stage": "switch", "email": email, "reason": "no_workspace_scoped"}
 
-    payload = build_cpa_payload(
-        email, at, res.get("chatgpt_account_id") or WORKSPACE_ID,
-        id_token=res.get("id_token", ""), concurrency=client.account_concurrency,
-    )
-    creds = payload["accounts"][0]["credentials"]
-    existing_id = _find_account_id(client, email)  # 续期识别：已存在则更新, 否则新导入(避免重复号)
-    try:
-        if existing_id:
-            client.update_openai_account(existing_id, {"credentials": creds})
-            acct_id, stage = existing_id, "renewed"
-        else:
-            client.import_account_data(payload)
-            acct_id, stage = _find_account_id(client, email), "imported"
-    except Exception as exc:  # noqa: BLE001
-        svc.report_result("failed", reason=f"{'update' if existing_id else 'import'}_failed: {str(exc)[:140]}")
-        return {"ok": False, "stage": "import", "email": email, "error": str(exc)[:200]}
-    _bind_group(client, acct_id, email, group_id)
-    svc.report_result("success", sub2api_account_id=acct_id, workspace_id=WORKSPACE_ID)
-    return {"ok": True, "stage": stage, "email": email, "workspace": WORKSPACE_ID, "sub2api_id": acct_id}
+    imported = []
+    for ws, d in scoped.items():
+        name = f"{email}#{ws[:8]}"  # 每个 workspace 一个独立账号(同一邮箱多号)
+        payload = build_cpa_payload(email, d["access_token"], ws, name=name,
+                                    id_token=d.get("id_token", ""), concurrency=client.account_concurrency)
+        creds = payload["accounts"][0]["credentials"]
+        existing_id = _find_account_id(client, name)  # 续期识别(按 name)：已存在则更新, 否则导入
+        try:
+            if existing_id:
+                client.update_openai_account(existing_id, {"credentials": creds})
+                acct_id, stage = existing_id, "renewed"
+            else:
+                client.import_account_data(payload)
+                acct_id, stage = _find_account_id(client, name), "imported"
+        except Exception as exc:  # noqa: BLE001
+            log(f"  ws {ws[:8]} {'update' if existing_id else 'import'} 失败: {str(exc)[:120]}")
+            continue
+        _bind_group(client, acct_id, name, group_id)
+        imported.append({"ws": ws, "stage": stage, "id": acct_id})
+        log(f"  ✓ {stage} {name} -> sub2api acct {acct_id}")
+
+    if not imported:
+        svc.report_result("failed", reason="所有 workspace 导入均失败")
+        return {"ok": False, "stage": "import", "email": email, "scoped": list(scoped.keys())}
+    svc.report_result("success", sub2api_account_id=",".join(i["id"] for i in imported if i["id"]),
+                      workspace_id=",".join(scoped.keys()))
+    return {"ok": True, "stage": "imported", "email": email,
+            "count": len(imported), "total_ws": len(res.get("workspaces") or {}), "accounts": imported}
 
 
 def main():
