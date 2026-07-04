@@ -16,6 +16,10 @@ on:
         description: "how many parallel jobs (1-10); pool caps real work by availability"
         required: false
         default: "5"
+      mail_kind:
+        description: "which mailbox kind to lease from the pool: outlook | gmail"
+        required: false
+        default: "outlook"
 
 jobs:
   setup:
@@ -66,6 +70,7 @@ jobs:
         timeout-minutes: 20
         env:
           MAIL_PROVIDER: outlook
+          MAIL_KIND: ${{ github.event.inputs.mail_kind || 'outlook' }}
           OUTLOOK_POOL_URL: ${{ secrets.OUTLOOK_POOL_URL }}
           POOL_API_KEY: ${{ secrets.POOL_API_KEY }}
           WORKSPACE_ID: ${{ secrets.WORKSPACE_ID }}

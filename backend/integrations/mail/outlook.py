@@ -369,11 +369,17 @@ class _PoolClient:
         r.raise_for_status()
         return r.json()
 
-    def lease(self, count: int = 1, leased_by: str = "") -> list[dict[str, Any]]:
+    def lease(self, count: int = 1, leased_by: str = "", kind: str = "") -> list[dict[str, Any]]:
         r = self._s.post(f"{self.base}/api/lease", headers=self._headers(),
-                         json={"count": count, "leased_by": leased_by}, timeout=self.timeout)
+                         json={"count": count, "leased_by": leased_by, "kind": kind}, timeout=self.timeout)
         r.raise_for_status()
         return r.json().get("leased") or []
+
+    def available(self, kind: str = "") -> int:
+        r = self._s.get(f"{self.base}/api/available", headers=self._headers(),
+                        params={"kind": kind}, timeout=self.timeout)
+        r.raise_for_status()
+        return int(r.json().get("available") or 0)
 
     def report(self, acct_id: int, status: str, **fields: Any) -> dict[str, Any]:
         r = self._s.post(f"{self.base}/api/accounts/{acct_id}/result", headers=self._headers(),
@@ -407,6 +413,7 @@ class OutlookEmailService:
         # so parallel CI jobs / re-runs never collide and results are written back.
         self._pool_url = _cfg("OUTLOOK_POOL_URL")
         self._pool_key = _cfg("POOL_API_KEY")
+        self._mail_kind = _cfg("MAIL_KIND").lower()  # "gmail" | "outlook" | "" (any); a batch is one kind
         self.pool_mode = bool(self._pool_url and self._pool_key)
         self._pool = _PoolClient(self._pool_url, self._pool_key) if self.pool_mode else None
         self._leased: dict[str, Any] | None = None
@@ -435,7 +442,7 @@ class OutlookEmailService:
             return {"email": acct.email}
 
     def _lease_from_pool(self) -> dict[str, str]:
-        leased = self._pool.lease(count=1, leased_by=_cfg("JOB_INDEX") or "runner")  # type: ignore[union-attr]
+        leased = self._pool.lease(count=1, leased_by=_cfg("JOB_INDEX") or "runner", kind=self._mail_kind)  # type: ignore[union-attr]
         if not leased:
             raise RuntimeError("Outlook 池已空：pool 无可租用账号（available=0）")
         a = leased[0]
@@ -457,9 +464,9 @@ class OutlookEmailService:
         """Available (bootstrapped, unused) count — pool available, or local pool size."""
         if self.pool_mode:
             try:
-                return int(self._pool.stats().get("available", 0))  # type: ignore[union-attr]
+                return self._pool.available(self._mail_kind)  # type: ignore[union-attr]
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[Outlook] pool stats failed: %s", exc)
+                logger.warning("[Outlook] pool available failed: %s", exc)
                 return 0
         used = self._load_used()
         return sum(1 for e, a in self._accounts.items() if a.bootstrapped and e not in used)

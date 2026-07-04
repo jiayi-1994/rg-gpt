@@ -102,6 +102,18 @@ def _now() -> float:
     return time.time()
 
 
+def _lease_where(kind: str) -> str:
+    """SQL predicate (on top of status='available') for leasable accounts of a kind.
+    gmail -> gmail domain + app password; outlook -> non-gmail + refresh_token; else any."""
+    gmail = "(instr(lower(email),'@gmail.com')>0 OR instr(lower(email),'@googlemail.com')>0)"
+    k = (kind or "").strip().lower()
+    if k == "gmail":
+        return f"{gmail} AND password<>''"
+    if k == "outlook":
+        return f"NOT {gmail} AND refresh_token<>''"
+    return f"(refresh_token<>'' OR ({gmail} AND password<>''))"
+
+
 def _reap_stale(conn: sqlite3.Connection) -> None:
     cutoff = _now() - LEASE_TTL_SECONDS
     conn.execute(
@@ -183,6 +195,17 @@ def stats() -> dict[str, Any]:
     return counts
 
 
+@app.get("/api/available", dependencies=[Depends(require_key)])
+def available(kind: str = Query(default="")) -> dict[str, Any]:
+    """Count leasable accounts of a kind (gmail|outlook|any) — runner caps count by this."""
+    with _tx() as conn:
+        _reap_stale(conn)
+        n = conn.execute(
+            f"SELECT COUNT(*) c FROM accounts WHERE status='available' AND {_lease_where(kind)}"
+        ).fetchone()["c"]
+    return {"available": int(n or 0), "kind": kind or "any"}
+
+
 @app.get("/api/accounts", dependencies=[Depends(require_key)])
 def list_accounts(status: str = Query(default=""), limit: int = Query(default=500, le=5000)) -> dict[str, Any]:
     with _tx() as conn:
@@ -234,14 +257,13 @@ def lease(payload: dict = Body(default={})) -> dict[str, Any]:
     Returns FULL credentials. Body: {"count":1, "leased_by":"job-1"}."""
     count = max(1, min(int(payload.get("count") or 1), 50))
     leased_by = str(payload.get("leased_by") or "")[:80]
+    kind = str(payload.get("kind") or "")  # "gmail" | "outlook" | "" (any)
     out = []
     with _tx() as conn:
         _reap_stale(conn)
         rows = conn.execute(
-            "SELECT * FROM accounts WHERE status='available' AND ("
-            "  refresh_token<>'' OR ("
-            "    (instr(lower(email),'@gmail.com')>0 OR instr(lower(email),'@googlemail.com')>0) AND password<>''"
-            "  )) ORDER BY id LIMIT ?",
+            f"SELECT * FROM accounts WHERE status='available' AND {_lease_where(kind)} "
+            "ORDER BY id LIMIT ?",
             (count,),
         ).fetchall()
         for r in rows:
