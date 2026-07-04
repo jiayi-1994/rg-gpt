@@ -421,8 +421,29 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                 if clicked_signup:
                     break
             if not clicked_signup:
+                # chatgpt.com 偶发直接跳统一登录页(/auth/login) —— 没 Sign up 按钮但有邮箱框，
+                # 直接进邮箱步骤即可(输入邮箱后 ChatGPT 自动分流 注册/登录)。
+                try:
+                    if page.query_selector('input[type="email"], input[name="email"]'):
+                        logger.info(f"[browser-reg] 无 Sign up 按钮但有邮箱框, 直接进邮箱步骤 URL={page.url[:80]}")
+                        clicked_signup = True
+                except Exception:  # noqa: BLE001
+                    pass
+            if not clicked_signup:
+                # 兜底：显式导航到统一登录/注册页再找邮箱框
+                for u in ("https://chatgpt.com/", "https://auth.openai.com/log-in"):
+                    try:
+                        page.goto(u, wait_until="domcontentloaded", timeout=40000)
+                        time.sleep(4)
+                        if page.query_selector('input[type="email"], input[name="email"]'):
+                            logger.info(f"[browser-reg] goto {u} 拿到邮箱框")
+                            clicked_signup = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+            if not clicked_signup:
                 page.screenshot(path="/tmp/browser_reg_no_signup.png")
-                raise RuntimeError(f"未找到 Sign up 按钮, URL={page.url[:120]}")
+                raise RuntimeError(f"未找到 Sign up 按钮/邮箱框, URL={page.url[:120]}")
 
             # 等待跳转到 auth.openai.com 或 modal 加载（含重试点击）
             pre_url = page.url
