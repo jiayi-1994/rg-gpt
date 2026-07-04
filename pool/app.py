@@ -207,15 +207,20 @@ def available(kind: str = Query(default="")) -> dict[str, Any]:
 
 
 @app.get("/api/accounts", dependencies=[Depends(require_key)])
-def list_accounts(status: str = Query(default=""), limit: int = Query(default=500, le=5000)) -> dict[str, Any]:
+def list_accounts(status: str = Query(default=""), search: str = Query(default=""),
+                  limit: int = Query(default=1000, le=5000)) -> dict[str, Any]:
+    conds: list[str] = []
+    params: list[Any] = []
+    if status:
+        conds.append("status=?")
+        params.append(status)
+    if search.strip():
+        conds.append("email LIKE ?")
+        params.append(f"%{search.strip().lower()}%")
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
     with _tx() as conn:
         _reap_stale(conn)
-        if status:
-            rows = conn.execute(
-                "SELECT * FROM accounts WHERE status=? ORDER BY updated_at DESC LIMIT ?", (status, limit)
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM accounts ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute(f"SELECT * FROM accounts{where} ORDER BY id LIMIT ?", (*params, limit)).fetchall()
     return {"accounts": [_redact(r) for r in rows]}
 
 
@@ -416,22 +421,36 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </header>
 <main>
   <div class="stats" id="stats"></div>
-  <div style="margin:0 0 12px;display:flex;gap:8px"><button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button><button class="chip" style="background:#6f42c1;color:#fff;border-color:#6f42c1;font-weight:600" onclick="expandPlus()">＋ 展开 +5 别名(现有号)</button></div>
+  <div style="margin:0 0 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input id="search" placeholder="🔍 搜邮箱..." style="padding:6px 10px;border:1px solid #d0d7de;border-radius:6px;min-width:220px;font-size:13px">
+    <button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button>
+    <button class="chip" style="background:#6f42c1;color:#fff;border-color:#6f42c1;font-weight:600" onclick="expandPlus()">＋ 展开 +5 别名(现有号)</button>
+  </div>
   <details style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:600">➕ 批量添加账号</summary>
     <p class="muted">一行一个：<code>email----password----client_id----refresh_token</code>（字段顺序自动识别）</p>
     <textarea id="bulk" placeholder="foo@outlook.com----pw----9e5f94bc-...----M.C5..."></textarea>
     <div style="margin-top:8px"><button class="primary" onclick="addAccounts()">添加</button></div>
   </details>
   <table><thead><tr>
-    <th>ID</th><th>邮箱</th><th>状态</th><th>次数</th><th>RT</th><th>sub2api</th><th>原因</th><th>更新</th><th>操作</th>
+    <th onclick="setSort('id')" style="cursor:pointer">ID ⇅</th>
+    <th onclick="setSort('email')" style="cursor:pointer">邮箱 ⇅</th>
+    <th onclick="setSort('status')" style="cursor:pointer">状态 ⇅</th>
+    <th onclick="setSort('attempts')" style="cursor:pointer">次数 ⇅</th>
+    <th>RT</th>
+    <th onclick="setSort('sub2api_account_id')" style="cursor:pointer">sub2api ⇅</th>
+    <th>原因</th>
+    <th onclick="setSort('updated_at')" style="cursor:pointer">更新 ⇅</th>
+    <th>操作</th>
   </tr></thead><tbody id="rows"></tbody></table>
 </main>
 <script>
  const $=s=>document.querySelector(s);
- let filter="";
+ let filter="", searchQ="", sortKey="id", sortDir="asc";
  const key=()=>$("#key").value.trim();
  $("#key").value=localStorage.getItem("poolKey")||"";
  $("#key").addEventListener("change",()=>{localStorage.setItem("poolKey",key());refresh();});
+ let _st; $("#search").addEventListener("input",()=>{clearTimeout(_st);_st=setTimeout(()=>{searchQ=$("#search").value.trim();refresh();},300);});
+ function setSort(k){if(sortKey===k)sortDir=sortDir==='asc'?'desc':'asc';else{sortKey=k;sortDir='asc';}refresh();}
  async function api(path,opts={}){
    opts.headers=Object.assign({"X-API-Key":key(),"Content-Type":"application/json"},opts.headers||{});
    const r=await fetch(path,opts);
@@ -445,7 +464,9 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
      const st=await api("/api/stats");
      const order=["total","available","leased","success","failed","stale","disabled"];
      $("#stats").innerHTML=order.map(s=>`<span class="chip ${filter===(s==='total'?'':s)?'active':''}" onclick="setFilter('${s==='total'?'':s}')">${s}<b>${st[s]??0}</b></span>`).join("");
-     const {accounts}=await api("/api/accounts"+(filter?`?status=${filter}`:""));
+     const qp=new URLSearchParams(); if(filter)qp.set("status",filter); if(searchQ)qp.set("search",searchQ);
+     const {accounts}=await api("/api/accounts"+(qp.toString()?"?"+qp.toString():""));
+     accounts.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(typeof x==="string")x=x.toLowerCase();if(typeof y==="string")y=y.toLowerCase();if(x==null)x="";if(y==null)y="";if(x<y)return sortDir==='asc'?-1:1;if(x>y)return sortDir==='asc'?1:-1;return 0;});
      $("#rows").innerHTML=accounts.map(a=>`<tr>
        <td>${a.id}</td><td>${a.email}</td>
        <td><span class="s ${a.status}">${a.status}</span></td>
