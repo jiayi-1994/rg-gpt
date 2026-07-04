@@ -44,6 +44,7 @@ POOL_API_KEY = os.getenv("POOL_API_KEY", "").strip()
 POOL_DB = os.getenv("POOL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pool.db"))
 LEASE_TTL_SECONDS = int(os.getenv("POOL_LEASE_TTL", "1200"))  # crashed-job lease auto-expires -> stale
 THUNDERBIRD_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+GMAIL_DOMAINS = ("gmail.com", "googlemail.com")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 TERMINAL_OK = "success"
@@ -119,6 +120,10 @@ def parse_line(line: str) -> dict[str, str] | None:
     email = parts[0].lower()
     if not email or "@" not in email:
         return None
+    # Gmail: email----app_password (no client_id/refresh_token).
+    if email.split("@")[-1] in GMAIL_DOMAINS:
+        return {"email": email, "password": (parts[1] if len(parts) > 1 else "").replace(" ", ""),
+                "client_id": "", "refresh_token": ""}
     password = parts[1] if len(parts) > 1 else ""
     refresh_token, client_id = "", THUNDERBIRD_CLIENT_ID
     for tok in (p for p in parts[2:] if p):
@@ -233,8 +238,10 @@ def lease(payload: dict = Body(default={})) -> dict[str, Any]:
     with _tx() as conn:
         _reap_stale(conn)
         rows = conn.execute(
-            "SELECT * FROM accounts WHERE status='available' AND refresh_token<>'' "
-            "ORDER BY id LIMIT ?",
+            "SELECT * FROM accounts WHERE status='available' AND ("
+            "  refresh_token<>'' OR ("
+            "    (instr(lower(email),'@gmail.com')>0 OR instr(lower(email),'@googlemail.com')>0) AND password<>''"
+            "  )) ORDER BY id LIMIT ?",
             (count,),
         ).fetchall()
         for r in rows:

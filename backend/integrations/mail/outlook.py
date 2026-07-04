@@ -70,6 +70,11 @@ IMAP_PORT = 993
 # Folders OpenAI OTP mail can land in on a fresh mailbox.
 IMAP_FOLDERS = ("INBOX", "Junk")
 
+# Gmail: app-password IMAP (2FA + app password). Supports +tag AND dot sub-addressing.
+GMAIL_IMAP_HOST = "imap.gmail.com"
+GMAIL_FOLDERS = ("INBOX", "[Gmail]/Spam")
+GMAIL_DOMAINS = ("gmail.com", "googlemail.com")
+
 OTP_REQUEST_GRACE_SECONDS = 60
 DEFAULT_POLL_INTERVAL = 5.0
 ACCESS_TOKEN_SKEW_SECONDS = 60  # refresh a bit before actual expiry
@@ -172,46 +177,64 @@ def _xoauth2_bytes(email: str, access_token: str) -> bytes:
     return f"user={email}\x01auth=Bearer {access_token}\x01\x01".encode()
 
 
-def imap_read_messages(email: str, access_token: str, *, per_folder: int = 20) -> list[dict[str, Any]]:
-    """Return recent messages (newest first) across INBOX + Junk via XOAUTH2."""
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+def _imap_collect(conn: imaplib.IMAP4_SSL, folders: tuple[str, ...], per_folder: int) -> list[dict[str, Any]]:
+    """After the connection is authenticated, collect recent messages (newest first)."""
     out: list[dict[str, Any]] = []
+    for folder in folders:
+        typ, _ = conn.select(folder, readonly=True)
+        if typ != "OK":
+            continue
+        typ, data = conn.search(None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            continue
+        ids = data[0].split()
+        for msg_id in reversed(ids[-per_folder:]):
+            typ, msg_data = conn.fetch(msg_id, "(RFC822)")
+            if typ != "OK" or not msg_data or not msg_data[0]:
+                continue
+            msg = email_pkg.message_from_bytes(msg_data[0][1])
+            subject, text_body, html_body, from_addr = _parse_message(msg)
+            out.append({
+                "folder": folder, "subject": subject, "text": text_body, "html": html_body,
+                "sender": from_addr, "recipients": _msg_recipients(msg),
+                "received_at": _parse_dt(msg.get("Date")),
+            })
+    out.sort(key=lambda m: m["received_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return out
+
+
+def imap_read_messages(email: str, access_token: str, *, per_folder: int = 20) -> list[dict[str, Any]]:
+    """Outlook: recent messages across INBOX + Junk via XOAUTH2."""
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
         try:
             conn.authenticate("XOAUTH2", lambda _challenge: _xoauth2_bytes(email, access_token))
         except imaplib.IMAP4.error as exc:
             raise OutlookAuthError(f"XOAUTH2 login failed for {email}: {exc}") from exc
-        for folder in IMAP_FOLDERS:
-            typ, _ = conn.select(folder, readonly=True)
-            if typ != "OK":
-                continue
-            typ, data = conn.search(None, "ALL")
-            if typ != "OK" or not data or not data[0]:
-                continue
-            ids = data[0].split()
-            for msg_id in reversed(ids[-per_folder:]):
-                typ, msg_data = conn.fetch(msg_id, "(RFC822)")
-                if typ != "OK" or not msg_data or not msg_data[0]:
-                    continue
-                raw = msg_data[0][1]
-                msg = email_pkg.message_from_bytes(raw)
-                subject, text_body, html_body, from_addr = _parse_message(msg)
-                out.append({
-                    "folder": folder,
-                    "subject": subject,
-                    "text": text_body,
-                    "html": html_body,
-                    "sender": from_addr,
-                    "recipients": _msg_recipients(msg),
-                    "received_at": _parse_dt(msg.get("Date")),
-                })
+        return _imap_collect(conn, IMAP_FOLDERS, per_folder)
     finally:
         try:
             conn.logout()
         except Exception:  # noqa: BLE001
             pass
-    out.sort(key=lambda m: m["received_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    return out
+
+
+def gmail_imap_read_messages(login_email: str, app_password: str, *, per_folder: int = 20) -> list[dict[str, Any]]:
+    """Gmail: recent messages via plain IMAP LOGIN with an app password (2FA + app pw).
+    login_email may be a dotted/base form — Gmail normalizes dots; the app password
+    belongs to the underlying account. Filtering by exact recipient happens upstream."""
+    conn = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, IMAP_PORT)
+    try:
+        try:
+            conn.login(login_email, app_password)
+        except imaplib.IMAP4.error as exc:
+            raise OutlookAuthError(f"Gmail IMAP login failed for {login_email}: {exc}") from exc
+        return _imap_collect(conn, GMAIL_FOLDERS, per_folder)
+    finally:
+        try:
+            conn.logout()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---- account pool -------------------------------------------------------------
@@ -223,11 +246,14 @@ class OutlookAccount:
     password: str = ""
     refresh_token: str = ""
     client_id: str = THUNDERBIRD_CLIENT_ID
+    kind: str = "outlook"  # "outlook" (XOAUTH2 refresh_token) or "gmail" (app password in .password)
     _access_token: str = field(default="", repr=False)
     _access_expiry: float = field(default=0.0, repr=False)
 
     @property
     def bootstrapped(self) -> bool:
+        if self.kind == "gmail":
+            return bool(self.password)  # app password
         return bool(self.refresh_token)
 
     def access_token(self) -> str:
@@ -261,6 +287,11 @@ def parse_account_line(line: str) -> OutlookAccount | None:
         return None
     parts = [p.strip() for p in line.split("----")]
     email = parts[0].lower()
+    if not email:
+        return None
+    # Gmail: email----app_password (2FA app password; supports +tag and dot sub-addressing).
+    if email.split("@")[-1] in GMAIL_DOMAINS:
+        return OutlookAccount(email=email, password=(parts[1] if len(parts) > 1 else "").replace(" ", ""), kind="gmail")
     password = parts[1] if len(parts) > 1 else ""
     refresh_token = ""
     client_id = THUNDERBIRD_CLIENT_ID
@@ -269,8 +300,6 @@ def parse_account_line(line: str) -> OutlookAccount | None:
             client_id = tok
         elif len(tok) > len(refresh_token):
             refresh_token = tok  # longest non-UUID field is the refresh_token
-    if not email:
-        return None
     return OutlookAccount(email=email, password=password, refresh_token=refresh_token, client_id=client_id)
 
 
@@ -410,10 +439,14 @@ class OutlookEmailService:
         if not leased:
             raise RuntimeError("Outlook 池已空：pool 无可租用账号（available=0）")
         a = leased[0]
-        acct = OutlookAccount(
-            email=str(a["email"]).lower(), password=a.get("password", ""),
-            refresh_token=a.get("refresh_token", ""), client_id=a.get("client_id") or THUNDERBIRD_CLIENT_ID,
-        )
+        email = str(a["email"]).lower()
+        if email.split("@")[-1] in GMAIL_DOMAINS:
+            acct = OutlookAccount(email=email, password=a.get("password", ""), kind="gmail")
+        else:
+            acct = OutlookAccount(
+                email=email, password=a.get("password", ""),
+                refresh_token=a.get("refresh_token", ""), client_id=a.get("client_id") or THUNDERBIRD_CLIENT_ID,
+            )
         self._accounts[acct.email] = acct
         self._leased = {"id": a["id"], "email": acct.email, "lease_token": a.get("lease_token", "")}
         self._claimed_email = acct.email
@@ -478,8 +511,11 @@ class OutlookEmailService:
         deadline = time.time() + max(1, int(timeout or 300))
         while time.time() < deadline:
             try:
-                token = self._base_access_token(acct, base)
-                mails = imap_read_messages(base, token)
+                if acct.kind == "gmail":
+                    mails = gmail_imap_read_messages(base, acct.password)  # app-password LOGIN
+                else:
+                    token = self._base_access_token(acct, base)
+                    mails = imap_read_messages(base, token)
             except OutlookAuthError as exc:
                 logger.warning("[Outlook] read error for %s: %s", base, exc)
                 time.sleep(self._poll_interval)
