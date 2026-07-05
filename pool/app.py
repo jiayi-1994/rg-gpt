@@ -395,18 +395,47 @@ def _export_line(r: sqlite3.Row) -> str:
     return "----".join(parts)
 
 
+def _strip_plus(email: str) -> str:
+    """user+3@x.com -> user@x.com（母号邮箱）。"""
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return email
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
 @app.get("/api/export", response_class=PlainTextResponse, dependencies=[Depends(require_key)])
-def export_bases(status: str = Query(default="")) -> str:
-    """导出母号(无 +N 子号)的原始凭证行，纯文本，方便备份/重灌。可选 status 过滤。"""
-    conds = ["instr(email,'+')=0"]  # 只导母号
-    params: list[Any] = []
+def export_bases(status: str = Query(default=""), mode: str = Query(default="base")) -> str:
+    """导出凭证行，纯文本，方便备份/重灌。
+    mode=base(默认): 从子号反推母号并去重（+N 共用母号凭证）→ 每个母号一行。
+    mode=all: 每个账号(含子号)导一行，完整备份。可选 status 过滤。"""
+    conds, params = [], []
     if status:
         conds.append("status=?")
         params.append(status)
-    where = " WHERE " + " AND ".join(conds)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
     with _tx() as conn:
         rows = conn.execute(f"SELECT * FROM accounts{where} ORDER BY id", params).fetchall()
-    return "\n".join(_export_line(r) for r in rows) + ("\n" if rows else "")
+    if mode == "all":
+        return "\n".join(_export_line(r) for r in rows) + ("\n" if rows else "")
+    # mode=base: 按母号邮箱去重，真母号行优先，否则用子号凭证反推
+    seen: dict[str, sqlite3.Row] = {}
+    for r in rows:
+        base = _strip_plus(r["email"])
+        if base not in seen or "+" not in r["email"]:  # 真母号行覆盖子号反推
+            seen[base] = r
+    out = []
+    for base, r in seen.items():
+        pw, cid, rt = r["password"] or "", r["client_id"] or "", r["refresh_token"] or ""
+        if base.split("@")[-1] in GMAIL_DOMAINS:
+            out.append(f"{base}----{pw}")
+        else:
+            parts = [base, pw]
+            if cid:
+                parts.append(cid)
+            if rt:
+                parts.append(rt)
+            out.append("----".join(parts))
+    return "\n".join(out) + ("\n" if out else "")
 
 
 @app.get("/", response_class=HTMLResponse)
