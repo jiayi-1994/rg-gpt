@@ -217,3 +217,5 @@ ssh: systemctl restart outlook-pool
 - playwright 锁 1.60.0（1.61 崩 camoufox）
 - 已注册号走 /workspace → 选个人账户 → 正常 join（别跳过）；密码注册的号自动流程进不去
 - leased 号永不自动回收（半注册撞 email in use）；短命 CPA 靠重跑续期
+- OTP 提交后落 `account_deactivated` 页 = 号被封 → runner 抛 `AccountDeactivated` →
+  pool `report_result("banned")` **硬删该号**（不再租/重试），区别于普通 failed
