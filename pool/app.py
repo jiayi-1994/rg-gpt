@@ -291,8 +291,8 @@ def report_result(acct_id: int, payload: dict = Body(...)) -> dict[str, Any]:
     """Report outcome for a leased account. Body: {status: success|failed, reason,
     sub2api_account_id, refresh_token, workspace_id, lease_token}."""
     status = str(payload.get("status") or "").strip().lower()
-    if status not in ("success", "failed"):
-        raise HTTPException(400, "status must be 'success' or 'failed'")
+    if status not in ("success", "failed", "banned"):
+        raise HTTPException(400, "status must be 'success', 'failed' or 'banned'")
     lease_token = str(payload.get("lease_token") or "")
     with _tx() as conn:
         row = conn.execute("SELECT * FROM accounts WHERE id=?", (acct_id,)).fetchone()
@@ -300,6 +300,10 @@ def report_result(acct_id: int, payload: dict = Body(...)) -> dict[str, Any]:
             raise HTTPException(404, "account not found")
         if lease_token and row["lease_token"] and lease_token != row["lease_token"]:
             raise HTTPException(409, "lease_token mismatch (account re-leased?)")
+        if status == "banned":
+            # OpenAI 封号(account_deactivated): 号废了, 直接删出池(不再租/不再重试)
+            conn.execute("DELETE FROM accounts WHERE id=?", (acct_id,))
+            return {"ok": True, "id": acct_id, "status": "banned", "deleted": True}
         new_rt = str(payload.get("refresh_token") or "")  # runner writes back rotated MSA RT
         conn.execute(
             "UPDATE accounts SET status=?, reason=?, sub2api_account_id=?, workspace_id=?, "

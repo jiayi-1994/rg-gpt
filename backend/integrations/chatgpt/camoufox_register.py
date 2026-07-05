@@ -30,6 +30,22 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 
+class AccountDeactivated(RuntimeError):
+    """OTP 后 OpenAI 返回 account_deactivated —— 邮箱对应的 ChatGPT 号被封禁/删除。
+    runner 应把该池号删除(不再租/不再重试)，区别于普通 failed。"""
+
+
+def _account_deactivated(page) -> bool:
+    """OTP 提交后是否落到 account_deactivated 封号页(auth.openai.com/email-verification)。"""
+    try:
+        body = (page.content() or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return ("account_deactivated" in body
+            or "account has been deactivated" in body
+            or "已被删除或停用" in body)
+
+
 def _gen_name() -> tuple[str, str]:
     first_names = ["James", "John", "Emily", "Sophia", "Michael", "Oliver", "Emma",
                    "William", "Amelia", "Lucas", "Mia", "Ethan"]
@@ -668,6 +684,11 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                         break
                 time.sleep(4)
 
+                # 号被封禁：OTP 提交后落 account_deactivated 页 → 抛专用异常, runner 删池号
+                if _account_deactivated(page):
+                    page.screenshot(path="/tmp/browser_reg_deactivated.png")
+                    raise AccountDeactivated(f"account_deactivated (ChatGPT 号被封禁), email={email}")
+
                 # OpenAI 在 OTP 错误时会显示 "Incorrect code" 红字，反复点
                 # Continue 会触发 max_check_attempts 风控（永久卡死）。早退。
                 try:
@@ -692,6 +713,8 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                     _u = (page.url or "").lower()
                 except Exception:  # noqa: BLE001
                     _u = ""
+                if "email-verification" in _u and _account_deactivated(page):
+                    raise AccountDeactivated(f"account_deactivated (ChatGPT 号被封禁), email={email}")
                 if "/workspace" in _u:
                     logger.info("[browser-reg] 命中 workspace 选择页(已注册账号) → 选个人账户")
                     _select_auth_workspace(page, logger.info)

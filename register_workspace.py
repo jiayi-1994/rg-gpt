@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-from backend.integrations.chatgpt.camoufox_register import browser_register
+from backend.integrations.chatgpt.camoufox_register import AccountDeactivated, browser_register
 from backend.integrations.mail.outlook import OutlookEmailService
 from backend.integrations.sub2api import Sub2ApiClient
 
@@ -211,6 +211,14 @@ def main():
         t0 = time.monotonic()
         try:
             r = run_one(client, svc, group_id)
+        except AccountDeactivated as exc:
+            # 号被 OpenAI 封禁 → 从池删除(不再租/重试)
+            r = {"ok": False, "stage": "banned", "error": str(exc)}
+            try:
+                svc.report_result("banned", reason=str(exc)[:150])
+                log("  号被封禁(account_deactivated) → 已从池删除")
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             r = {"ok": False, "stage": "exception", "error": str(exc)}
             try:
