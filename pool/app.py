@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 POOL_API_KEY = os.getenv("POOL_API_KEY", "").strip()
 POOL_DB = os.getenv("POOL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pool.db"))
@@ -381,6 +381,34 @@ def delete(acct_id: int) -> dict[str, Any]:
     return {"ok": True, "id": acct_id, "deleted": True}
 
 
+def _export_line(r: sqlite3.Row) -> str:
+    """把一行还原成原始凭证格式：gmail=email----app_password；outlook=email----pw----cid----rt。"""
+    email = r["email"]
+    pw, cid, rt = r["password"] or "", r["client_id"] or "", r["refresh_token"] or ""
+    if email.split("@")[-1] in GMAIL_DOMAINS:
+        return f"{email}----{pw}"
+    parts = [email, pw]
+    if cid:
+        parts.append(cid)
+    if rt:
+        parts.append(rt)
+    return "----".join(parts)
+
+
+@app.get("/api/export", response_class=PlainTextResponse, dependencies=[Depends(require_key)])
+def export_bases(status: str = Query(default="")) -> str:
+    """导出母号(无 +N 子号)的原始凭证行，纯文本，方便备份/重灌。可选 status 过滤。"""
+    conds = ["instr(email,'+')=0"]  # 只导母号
+    params: list[Any] = []
+    if status:
+        conds.append("status=?")
+        params.append(status)
+    where = " WHERE " + " AND ".join(conds)
+    with _tx() as conn:
+        rows = conn.execute(f"SELECT * FROM accounts{where} ORDER BY id", params).fetchall()
+    return "\n".join(_export_line(r) for r in rows) + ("\n" if rows else "")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return INDEX_HTML
@@ -429,6 +457,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
     <input id="search" placeholder="🔍 搜邮箱..." style="padding:6px 10px;border:1px solid #d0d7de;border-radius:6px;min-width:220px;font-size:13px">
     <button class="chip" style="background:#cf222e;color:#fff;border-color:#cf222e;font-weight:600" onclick="resetAll()">↺ 全部重置为可用</button>
     <button class="chip" style="background:#6f42c1;color:#fff;border-color:#6f42c1;font-weight:600" onclick="expandPlus()">＋ 展开 +5 别名(现有号)</button>
+    <button class="chip" style="background:#1a7f37;color:#fff;border-color:#1a7f37;font-weight:600" onclick="exportBases()">⬇ 导出母号</button>
   </div>
   <details style="margin-bottom:14px"><summary style="cursor:pointer;font-weight:600">➕ 批量添加账号</summary>
     <p class="muted">一行一个：<code>email----password----client_id----refresh_token</code>（字段顺序自动识别）</p>
@@ -495,6 +524,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  async function act(id,what){await api(`/api/accounts/${id}/${what}`,{method:"POST"});refresh();}
  async function resetAll(){if(!confirm("把所有非停用账号重置为 available?"))return;const r=await api("/api/reset-all",{method:"POST"});$("#msg").textContent=`已重置 ${r.reset} 个`;refresh();}
  async function expandPlus(){if(!confirm("给每个 base 号补 +1..+5 别名(共6)?"))return;const r=await api("/api/expand-plus",{method:"POST",body:JSON.stringify({plus:5})});$("#msg").textContent=`新增 ${r.added} 个别名`;refresh();}
+ async function exportBases(){const r=await fetch("/api/export",{headers:{"X-API-Key":key()}});if(!r.ok){$("#msg").textContent="导出失败("+r.status+")";return;}const t=await r.text();const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t],{type:"text/plain"}));a.download="pool-bases.txt";a.click();URL.revokeObjectURL(a.href);$("#msg").textContent="已导出母号 "+(t.trim()?t.trim().split("\\n").length:0)+" 个";}
  async function del(id){if(!confirm("删除 #"+id+"?"))return;await api(`/api/accounts/${id}`,{method:"DELETE"});refresh();}
  refresh();setInterval(refresh,8000);
 </script>
