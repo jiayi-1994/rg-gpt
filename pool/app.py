@@ -339,6 +339,7 @@ def _otp_collect(conn: imaplib.IMAP4_SSL, folders: tuple[str, ...], per_folder: 
             msg = email_pkg.message_from_bytes(msg_data[0][1])
             subject, text_body, html_body = _otp_parse_message(msg)
             out.append({"subject": subject, "text": text_body, "html": html_body,
+                        "from": _otp_decode_hdr(msg.get("From", "")), "folder": folder,
                         "recipients": _otp_recipients(msg), "received_at": _otp_parse_dt(msg.get("Date"))})
     out.sort(key=lambda m: m["received_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return out
@@ -588,6 +589,58 @@ def fetch_otp(acct_id: int, lease_token: str = Query(default=""), since: float =
     return {"code": None, "email": email_addr}
 
 
+@app.get("/api/accounts/{acct_id}/mails", dependencies=[Depends(require_key)])
+def fetch_mails(acct_id: int, limit: int = Query(default=15, le=50)) -> dict[str, Any]:
+    """Read this account's mailbox over IMAP and return recent messages addressed to
+    THIS exact alias (To/Cc match — same filter as the OTP relay; +N aliases share one
+    physical inbox). Body is html->text (plain text only — email HTML is attacker-
+    controllable, never rendered raw). Admin inspection UI. Query: limit (<=50)."""
+    with _tx() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (acct_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "account not found")
+    email_addr = (row["email"] or "").strip().lower()
+    base = _strip_plus(email_addr)
+    is_gmail = email_addr.split("@")[-1] in GMAIL_DOMAINS
+    try:
+        if is_gmail:
+            if not row["password"]:
+                raise HTTPException(422, "gmail account has no app password")
+            mails = _otp_read_gmail(base, row["password"])
+        else:
+            if not row["refresh_token"]:
+                raise HTTPException(422, "outlook account has no refresh_token")
+            access_token, new_rt = _otp_access_token(base, row["refresh_token"], row["client_id"])
+            if new_rt:  # MSA rotated the RT — persist to every alias row sharing this mailbox
+                local, _, domain = base.partition("@")
+                with _tx() as conn:
+                    conn.execute(
+                        "UPDATE accounts SET refresh_token=?, updated_at=? WHERE email=? OR email LIKE ?",
+                        (new_rt, _now(), base, f"{local}+%@{domain}"))
+            mails = _otp_read_outlook(base, access_token)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"imap read failed: {str(exc)[:200]}")
+    out: list[dict[str, Any]] = []
+    for mail in mails:
+        recipients = mail.get("recipients") or set()
+        if recipients and email_addr not in recipients:
+            continue  # only mail addressed to this exact alias
+        body = mail.get("text") or _otp_html_to_text(mail.get("html"))
+        ra = mail.get("received_at")
+        out.append({
+            "from": mail.get("from") or "",
+            "subject": mail.get("subject") or "",
+            "folder": mail.get("folder") or "",
+            "date": ra.timestamp() if ra else None,
+            "body": (body or "").strip()[:4000],
+        })
+        if len(out) >= limit:
+            break
+    return {"email": email_addr, "count": len(out), "mails": out}
+
+
 @app.post("/api/accounts/{acct_id}/retry", dependencies=[Depends(require_key)])
 def retry(acct_id: int) -> dict[str, Any]:
     with _tx() as conn:
@@ -758,6 +811,17 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .s.success{background:#0969da;color:#fff}.s.failed{background:#ffebe9;color:#cf222e}
  .s.stale{background:#fff1e5;color:#bc4c00}.s.disabled{background:#eaeef2;color:#57606a}
  .muted{color:#57606a}
+ .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-start;justify-content:center;z-index:50}
+ .overlay.on{display:flex}
+ .modal{background:#fff;margin-top:40px;width:min(760px,94vw);max-height:86vh;overflow:auto;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
+ .modal .mhead{position:sticky;top:0;background:#1f2328;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
+ .modal .mhead b{font-size:14px}
+ .modal .mhead button{background:transparent;color:#fff;border:0;font-size:20px;cursor:pointer;line-height:1}
+ .mail{border-bottom:1px solid #eaeef2;padding:10px 14px}
+ .mail .meta{font-size:12px;color:#57606a;display:flex;gap:10px;flex-wrap:wrap}
+ .mail .subj{font-weight:600;margin:3px 0}
+ .mail pre{white-space:pre-wrap;word-break:break-word;font:12px/1.5 monospace;background:#f6f8fa;padding:8px;border-radius:6px;margin:6px 0 0;max-height:280px;overflow:auto}
+ .badge{background:#eaeef2;color:#57606a;border-radius:10px;padding:1px 7px;font-size:11px}
 </style></head><body>
 <header>
   <h1>Outlook 账号池</h1>
@@ -790,6 +854,12 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
     <th>操作</th>
   </tr></thead><tbody id="rows"></tbody></table>
 </main>
+<div class="overlay" id="mailOverlay" onclick="if(event.target===this)closeMails()">
+  <div class="modal">
+    <div class="mhead"><b id="mailTitle">邮件</b><button onclick="closeMails()" title="关闭">×</button></div>
+    <div id="mailBody" style="padding:4px 0"></div>
+  </div>
+</div>
 <script>
  const $=s=>document.querySelector(s);
  let filter="", searchQ="", sortKey="id", sortDir="asc";
@@ -805,6 +875,25 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    $("#msg").textContent="";return r.json();
  }
  function fmtTime(t){if(!t)return"";const d=new Date(t*1000);return d.toLocaleString();}
+ function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+ function closeMails(){$("#mailOverlay").classList.remove("on");$("#mailBody").innerHTML="";}
+ document.addEventListener("keydown",e=>{if(e.key==="Escape")closeMails();});
+ async function viewMails(id,email){
+   $("#mailTitle").textContent="邮件 · "+email;
+   $("#mailBody").innerHTML='<div class="mail muted">读取中…</div>';
+   $("#mailOverlay").classList.add("on");
+   try{
+     const r=await fetch(`/api/accounts/${id}/mails?limit=20`,{headers:{"X-API-Key":key()}});
+     if(!r.ok){$("#mailBody").innerHTML=`<div class="mail" style="color:#cf222e">读取失败 ${r.status}: ${esc((await r.text()).slice(0,200))}</div>`;return;}
+     const {mails}=await r.json();
+     if(!mails||!mails.length){$("#mailBody").innerHTML='<div class="mail muted">该地址无邮件</div>';return;}
+     $("#mailBody").innerHTML=mails.map(m=>`<div class="mail">
+       <div class="meta"><span>${esc(m.from)}</span><span>${m.date?fmtTime(m.date):""}</span>${m.folder?`<span class="badge">${esc(m.folder)}</span>`:""}</div>
+       <div class="subj">${esc(m.subject)||"(无主题)"}</div>
+       ${m.body?`<pre>${esc(m.body)}</pre>`:'<div class="muted" style="font-size:12px">(无正文)</div>'}
+     </div>`).join("");
+   }catch(e){$("#mailBody").innerHTML=`<div class="mail" style="color:#cf222e">${esc(e.message||e)}</div>`;}
+ }
  function fmtReset(t){if(!t)return"—";const rem=Math.round(t-Date.now()/1000);const d=new Date(t*1000);
    if(rem<=0)return`<span title="${d.toLocaleString()}">已复位</span>`;
    const h=Math.floor(rem/3600),m=Math.floor(rem%3600/60);
@@ -828,6 +917,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
        <td class="reason">${a.reason||""}</td>
        <td class="muted">${fmtTime(a.updated_at)}</td>
        <td>
+         <button onclick="viewMails(${a.id},'${a.email}')" title="查看该邮箱最近邮件">邮件</button>
          <button onclick="exportOne(${a.id})" title="复制登录收码凭证">导出</button>
          ${a.status!=='available'?`<button onclick="act(${a.id},'retry')">重置</button>`:""}
          ${a.status!=='disabled'?`<button onclick="act(${a.id},'disable')">停用</button>`:""}
