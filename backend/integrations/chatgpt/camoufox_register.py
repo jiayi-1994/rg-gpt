@@ -291,6 +291,76 @@ def _switch_workspace_and_get_token(page, workspace_id, access_token, log, *, ti
     return {"access_token": at, "id_token": (sess or {}).get("idToken", ""), "account_id": got}
 
 
+def _fetch_usage(page, access_token, log, *, max_retries=3) -> dict:
+    """Read /backend-api/wham/usage (Codex usage) in-browser and pull out
+    rate_limit.primary_window.reset_after_seconds.
+
+    Must run via page.evaluate — chatgpt.com/backend-api sits behind Cloudflare;
+    an out-of-browser Python request is blocked (same reason as _join_workspace).
+    Returns {ok, reset_after_seconds, status, raw}. Never raises — a failed read
+    is non-fatal (signup already succeeded, usage is a best-effort enrichment).
+    """
+    at = access_token
+    last = {"ok": False, "reset_after_seconds": None, "status": 0, "raw": ""}
+    for attempt in range(max_retries + 1):
+        try:
+            res = page.evaluate(
+                """async (a) => {
+                    const r = await fetch("/backend-api/wham/usage", {
+                        headers: {
+                            accept: "*/*",
+                            authorization: "Bearer " + a.at,
+                            "oai-language": navigator.language || "en-US",
+                            "x-openai-target-path": "/backend-api/wham/usage",
+                            "x-openai-target-route": "/backend-api/wham/usage",
+                        },
+                        mode: "cors", credentials: "include",
+                    });
+                    let t = ""; try { t = await r.text(); } catch (_) {}
+                    return { status: r.status, ok: r.ok, text: (t || "").slice(0, 2000) };
+                }""",
+                {"at": at},
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[usage] evaluate 异常: {str(e)[:80]}")
+            res = None
+        code = (res or {}).get("status") or 0
+        text = str((res or {}).get("text") or "")
+        last = {"ok": False, "reset_after_seconds": None, "status": code, "raw": text[:300]}
+        if res and res.get("ok"):
+            try:
+                body = json.loads(text)
+            except Exception:  # noqa: BLE001
+                body = {}
+            secs = (((body.get("rate_limit") or {}).get("primary_window") or {})
+                    .get("reset_after_seconds"))
+            if isinstance(secs, bool) or not isinstance(secs, (int, float)):
+                try:
+                    secs = int(secs)
+                except (TypeError, ValueError):
+                    secs = None
+            else:
+                secs = int(secs)
+            last = {"ok": True, "reset_after_seconds": secs, "status": code, "raw": text[:300]}
+            log(f"[usage] ✓ HTTP {code} reset_after_seconds={secs}")
+            return last
+        log(f"[usage] ✗ HTTP {code}: {text[:120]}")
+        # 401/403 → AT 失效, 重取 session 再试(同 join 逻辑)
+        if code in (401, 403):
+            try:
+                s = page.evaluate(
+                    """async () => { const r = await fetch("/api/auth/session", {credentials:"include"});
+                        return await r.json(); }"""
+                )
+                if isinstance(s, dict) and s.get("accessToken"):
+                    at = s["accessToken"]
+            except Exception:  # noqa: BLE001
+                pass
+        if attempt < max_retries:
+            time.sleep(3 * (attempt + 1))
+    return last
+
+
 def _select_auth_workspace(page, log, *, timeout=25) -> bool:
     """On auth.openai.com/workspace, select the PERSONAL account to reach chatgpt.com.
 
@@ -328,7 +398,8 @@ def _select_auth_workspace(page, log, *, timeout=25) -> bool:
     return "/workspace" not in (page.url or "").lower()
 
 
-def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "") -> dict:
+def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: str = "",
+                     fetch_usage: bool = False) -> dict:
     """
     用真实浏览器走注册流程。
     cfg: Config 实例（需要 proxy 字段）
@@ -336,6 +407,8 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
     oauth_session: 可选 OAuthSession；提供则注册完成后在同会话里跑 codex 授权拿 refresh_token。
     join_workspace_id: 可选 workspace id；提供则到达 chatgpt.com 后在同会话里申请加入该 workspace，
                        并把 chatgpt_account_id 写进返回结果（供 CPA/session 导入选定工作空间）。
+    fetch_usage: 可选；开启则到达 personal chatgpt.com 拿到 access_token 后在同会话里读一次
+                 /backend-api/wham/usage，结果(reset_after_seconds)写进 result["usage"]。
     返回 dict：与 AuthResult.to_dict() 格式兼容
     """
     from camoufox.sync_api import Camoufox
@@ -934,6 +1007,11 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
             result["access_token"] = session_info.get("accessToken", "")
             result["id_token"] = session_info.get("idToken", "") if isinstance(session_info, dict) else ""
             logger.info(f"[browser-reg] access_token 长度: {len(result['access_token'])}")
+
+            # [8.5] 可选：读 personal usage(wham/usage)。浏览器内执行以过 Cloudflare。
+            #        本流程不 join workspace —— personal token 直接读 rate_limit 复位窗口。
+            if fetch_usage and result["access_token"]:
+                result["usage"] = _fetch_usage(page, result["access_token"], logger.info)
 
             # [9] 提取 cookies
             all_cookies = ctx.cookies()

@@ -112,6 +112,17 @@ def _connect() -> sqlite3.Connection:
                 updated_at REAL
             )"""
         )
+        # 老库平滑升级：新增 personal usage(wham/usage) 复位窗口字段。ADD COLUMN 幂等——
+        # 列已存在则 OperationalError, 吞掉即可。
+        for ddl in (
+            "ALTER TABLE accounts ADD COLUMN usage_reset_seconds INTEGER",
+            "ALTER TABLE accounts ADD COLUMN usage_reset_at REAL",
+            "ALTER TABLE accounts ADD COLUMN usage_checked_at REAL",
+        ):
+            try:
+                _conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         _conn.commit()
     return _conn
 
@@ -499,6 +510,21 @@ def report_result(acct_id: int, payload: dict = Body(...)) -> dict[str, Any]:
             (status, str(payload.get("reason") or "")[:500], str(payload.get("sub2api_account_id") or ""),
              str(payload.get("workspace_id") or ""), new_rt, new_rt, _now(), acct_id),
         )
+        # personal usage(wham/usage) 复位窗口：runner 传了 usage_reset_seconds 才写(否则保留旧值)。
+        # 相对秒数会过期 → 同时算绝对复位 epoch(读时+秒) + 记读取时刻。
+        usecs = payload.get("usage_reset_seconds")
+        if usecs is not None:
+            try:
+                usecs = int(usecs)
+            except (TypeError, ValueError):
+                usecs = None
+            if usecs is not None:
+                now = _now()
+                conn.execute(
+                    "UPDATE accounts SET usage_reset_seconds=?, usage_reset_at=?, "
+                    "usage_checked_at=?, updated_at=? WHERE id=?",
+                    (usecs, now + usecs, now, now, acct_id),
+                )
     return {"ok": True, "id": acct_id, "status": status}
 
 
@@ -758,6 +784,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
     <th onclick="setSort('attempts')" style="cursor:pointer">次数 ⇅</th>
     <th>RT</th>
     <th onclick="setSort('sub2api_account_id')" style="cursor:pointer">sub2api ⇅</th>
+    <th onclick="setSort('usage_reset_at')" style="cursor:pointer" title="wham/usage 主窗口复位时间">复位 ⇅</th>
     <th>原因</th>
     <th onclick="setSort('updated_at')" style="cursor:pointer">更新 ⇅</th>
     <th>操作</th>
@@ -778,6 +805,10 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    $("#msg").textContent="";return r.json();
  }
  function fmtTime(t){if(!t)return"";const d=new Date(t*1000);return d.toLocaleString();}
+ function fmtReset(t){if(!t)return"—";const rem=Math.round(t-Date.now()/1000);const d=new Date(t*1000);
+   if(rem<=0)return`<span title="${d.toLocaleString()}">已复位</span>`;
+   const h=Math.floor(rem/3600),m=Math.floor(rem%3600/60);
+   return`<span title="${d.toLocaleString()}">${h?h+'h':''}${m}m 后</span>`;}
  async function refresh(){
    if(!key())return;
    try{
@@ -793,6 +824,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
        <td>${a.attempts}</td>
        <td class="muted">${a.has_refresh_token?"✓":"—"}</td>
        <td class="muted">${a.sub2api_account_id||""}</td>
+       <td class="muted">${fmtReset(a.usage_reset_at)}</td>
        <td class="reason">${a.reason||""}</td>
        <td class="muted">${fmtTime(a.updated_at)}</td>
        <td>

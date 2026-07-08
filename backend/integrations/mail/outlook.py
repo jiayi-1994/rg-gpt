@@ -472,17 +472,22 @@ class OutlookEmailService:
         return sum(1 for e, a in self._accounts.items() if a.bootstrapped and e not in used)
 
     def report_result(self, status: str, *, reason: str = "", sub2api_account_id: str = "",
-                      workspace_id: str = "") -> None:
-        """Write the outcome of the current leased account back to the pool (pool mode only)."""
+                      workspace_id: str = "", usage_reset_seconds: int | None = None) -> None:
+        """Write the outcome of the current leased account back to the pool (pool mode only).
+        usage_reset_seconds: 若非 None, 写回 personal wham/usage 复位窗口(池算绝对复位时间)。"""
         if not (self.pool_mode and self._leased):
             return
         acct = self._accounts.get(self._leased["email"])
         rt = acct.refresh_token if acct else ""  # possibly rotated during OTP read
+        extra: dict[str, Any] = {}
+        if usage_reset_seconds is not None:
+            extra["usage_reset_seconds"] = int(usage_reset_seconds)
         try:
             self._pool.report(  # type: ignore[union-attr]
                 int(self._leased["id"]), status, reason=reason[:500],
                 sub2api_account_id=sub2api_account_id, workspace_id=workspace_id,
                 refresh_token=rt, lease_token=self._leased.get("lease_token", ""),
+                **extra,
             )
             logger.info("[Outlook] pool result %s for %s (id=%s)",
                         status, self._leased["email"], self._leased["id"])

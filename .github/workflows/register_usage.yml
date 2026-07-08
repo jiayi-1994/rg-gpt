@@ -1,0 +1,83 @@
+name: register-usage (personal usage check)
+
+# Manually triggered. A setup job builds a matrix of exactly `parallel_jobs` jobs;
+# each leases mailbox(es) from the pool web service (atomic, so parallel jobs never
+# collide), signs up / OTP-logs-in ChatGPT to a PERSONAL account (no team-workspace
+# join, no sub2api import), reads /backend-api/wham/usage, and writes the primary
+# rate-limit reset window back to the pool. Finite pool -> manual dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count_per_job:
+        description: "accounts to process per job"
+        required: false
+        default: "1"
+      parallel_jobs:
+        description: "how many parallel jobs (1-10); pool caps real work by availability"
+        required: false
+        default: "5"
+      mail_kind:
+        description: "which mailbox kind to lease from the pool: outlook | gmail"
+        required: false
+        default: "gmail"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          N="${{ github.event.inputs.parallel_jobs || '5' }}"
+          [ "$N" -lt 1 ] 2>/dev/null && N=1
+          [ "$N" -gt 10 ] 2>/dev/null && N=10
+          echo "matrix=$(seq 1 "$N" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "will spawn $N job(s)"
+
+  usage:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        n: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install browser system libs (Firefox/Camoufox)
+        run: |
+          python -m playwright install-deps firefox || true
+          sudo apt-get update && sudo apt-get install -y xvfb || true
+
+      - name: Fetch Camoufox browser + geoip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python fetch_camoufox.py
+
+      - name: Usage check from pool
+        timeout-minutes: 20
+        env:
+          MAIL_PROVIDER: outlook
+          MAIL_KIND: ${{ github.event.inputs.mail_kind || 'gmail' }}
+          OUTLOOK_POOL_URL: ${{ secrets.OUTLOOK_POOL_URL }}
+          POOL_API_KEY: ${{ secrets.POOL_API_KEY }}
+          VERIFY_PROXY: ${{ secrets.VERIFY_PROXY }}
+          JOB_INDEX: ${{ matrix.n }}
+          OTP_TIMEOUT: "100"
+          JOB_BUDGET_SECONDS: "1000"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          xvfb-run -a python register_usage.py "${{ github.event.inputs.count_per_job || '1' }}"
