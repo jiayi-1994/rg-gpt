@@ -884,7 +884,16 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  function fmtTime(t){if(!t)return"";const d=new Date(t*1000);return d.toLocaleString();}
  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
  function closeMails(){$("#mailOverlay").classList.remove("on");$("#mailBody").innerHTML="";}
- async function copyCode(code,btn){try{await navigator.clipboard.writeText(code);const t=btn.textContent;btn.textContent="已复制";setTimeout(()=>btn.textContent=t,1200);}catch(e){}}
+ async function clip(text){
+   // 明文 HTTP(非 localhost) 下 navigator.clipboard 被禁 → execCommand 兜底
+   try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);return true;}}catch(e){}
+   try{const ta=document.createElement("textarea");ta.value=text;ta.readOnly=true;
+     ta.style.cssText="position:fixed;top:0;left:0;opacity:0";document.body.appendChild(ta);
+     ta.focus();ta.select();ta.setSelectionRange(0,ta.value.length);
+     const ok=document.execCommand("copy");document.body.removeChild(ta);return ok;
+   }catch(e){return false;}
+ }
+ async function copyCode(code,btn){const ok=await clip(code);const t=btn.textContent;btn.textContent=ok?"已复制":"复制失败";setTimeout(()=>btn.textContent=t,1200);}
  document.addEventListener("keydown",e=>{if(e.key==="Escape")closeMails();});
  async function viewMails(id){
    $("#mailTitle").textContent="邮件 #"+id;
@@ -949,8 +958,8 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    const r=await fetch(`/api/accounts/${id}/export`,{headers:{"X-API-Key":key()}});
    if(!r.ok){$("#msg").textContent="导出失败("+r.status+")";return;}
    const t=(await r.text()).trim();
-   try{await navigator.clipboard.writeText(t);$("#msg").textContent="已复制 #"+id+" 登录收码凭证";}
-   catch(e){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t+"\\n"],{type:"text/plain"}));a.download="acct-"+id+".txt";a.click();URL.revokeObjectURL(a.href);$("#msg").textContent="已导出 #"+id;}
+   if(await clip(t)){$("#msg").textContent="已复制 #"+id+" 登录收码凭证";}
+   else{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t+"\\n"],{type:"text/plain"}));a.download="acct-"+id+".txt";a.click();URL.revokeObjectURL(a.href);$("#msg").textContent="已导出 #"+id;}
  }
  async function del(id){if(!confirm("删除 #"+id+"?"))return;await api(`/api/accounts/${id}`,{method:"DELETE"});refresh();}
  refresh();setInterval(refresh,8000);
