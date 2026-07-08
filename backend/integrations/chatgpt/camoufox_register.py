@@ -1090,9 +1090,9 @@ def browser_register(cfg, mail_provider, oauth_session=None, join_workspace_id: 
                         f"[browser-reg] codex 授权未拿到 code (add_phone={result['add_phone']})"
                     )
 
-            # CPA/session 导入只需要 access_token（sub2api 忽略 session_token）；
-            # 仅在非 join 流程(需要 session cookie 的老路径)才强制要求 session_token。
-            need_session_token = not join_workspace_id
+            # CPA/session 导入只需要 access_token（sub2api 忽略 session_token）；usage 流同理
+            # 只需 access_token。仅在既不 join 也不读 usage 的老路径(需 session cookie)才强制 session_token。
+            need_session_token = not join_workspace_id and not fetch_usage
             if not result["access_token"] or (need_session_token and not result["session_token"]):
                 try:
                     page.screenshot(path="/tmp/browser_reg_missing_token.png")
