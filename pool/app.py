@@ -878,14 +878,15 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
  function closeMails(){$("#mailOverlay").classList.remove("on");$("#mailBody").innerHTML="";}
  document.addEventListener("keydown",e=>{if(e.key==="Escape")closeMails();});
- async function viewMails(id,email){
-   $("#mailTitle").textContent="邮件 · "+email;
+ async function viewMails(id){
+   $("#mailTitle").textContent="邮件 #"+id;
    $("#mailBody").innerHTML='<div class="mail muted">读取中…</div>';
    $("#mailOverlay").classList.add("on");
    try{
      const r=await fetch(`/api/accounts/${id}/mails?limit=20`,{headers:{"X-API-Key":key()}});
      if(!r.ok){$("#mailBody").innerHTML=`<div class="mail" style="color:#cf222e">读取失败 ${r.status}: ${esc((await r.text()).slice(0,200))}</div>`;return;}
-     const {mails}=await r.json();
+     const data=await r.json(),mails=data.mails;
+     $("#mailTitle").textContent="邮件 · "+(data.email||("#"+id));  // textContent = 安全, 无 XSS
      if(!mails||!mails.length){$("#mailBody").innerHTML='<div class="mail muted">该地址无邮件</div>';return;}
      $("#mailBody").innerHTML=mails.map(m=>`<div class="mail">
        <div class="meta"><span>${esc(m.from)}</span><span>${m.date?fmtTime(m.date):""}</span>${m.folder?`<span class="badge">${esc(m.folder)}</span>`:""}</div>
@@ -908,16 +909,16 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
      const {accounts}=await api("/api/accounts"+(qp.toString()?"?"+qp.toString():""));
      accounts.sort((a,b)=>{let x=a[sortKey],y=b[sortKey];if(typeof x==="string")x=x.toLowerCase();if(typeof y==="string")y=y.toLowerCase();if(x==null)x="";if(y==null)y="";if(x<y)return sortDir==='asc'?-1:1;if(x>y)return sortDir==='asc'?1:-1;return 0;});
      $("#rows").innerHTML=accounts.map(a=>`<tr>
-       <td>${a.id}</td><td>${a.email}</td>
+       <td>${a.id}</td><td>${esc(a.email)}</td>
        <td><span class="s ${a.status}">${a.status}</span></td>
        <td>${a.attempts}</td>
        <td class="muted">${a.has_refresh_token?"✓":"—"}</td>
-       <td class="muted">${a.sub2api_account_id||""}</td>
+       <td class="muted">${esc(a.sub2api_account_id||"")}</td>
        <td class="muted">${fmtReset(a.usage_reset_at)}</td>
-       <td class="reason">${a.reason||""}</td>
+       <td class="reason">${esc(a.reason||"")}</td>
        <td class="muted">${fmtTime(a.updated_at)}</td>
        <td>
-         <button onclick="viewMails(${a.id},'${a.email}')" title="查看该邮箱最近邮件">邮件</button>
+         <button onclick="viewMails(${a.id})" title="查看该邮箱最近邮件">邮件</button>
          <button onclick="exportOne(${a.id})" title="复制登录收码凭证">导出</button>
          ${a.status!=='available'?`<button onclick="act(${a.id},'retry')">重置</button>`:""}
          ${a.status!=='disabled'?`<button onclick="act(${a.id},'disable')">停用</button>`:""}
