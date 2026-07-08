@@ -629,11 +629,15 @@ def fetch_mails(acct_id: int, limit: int = Query(default=15, le=50)) -> dict[str
             continue  # only mail addressed to this exact alias
         body = mail.get("text") or _otp_html_to_text(mail.get("html"))
         ra = mail.get("received_at")
+        # 顺手提验证码(复用 OTP 抽取)，看码不用大海捞针；subject 优先(标题常直接带码)。
+        haystack = "\n".join(x for x in (mail.get("subject") or "", mail.get("text") or "",
+                                         _otp_html_to_text(mail.get("html"))) if x)
         out.append({
             "from": mail.get("from") or "",
             "subject": mail.get("subject") or "",
             "folder": mail.get("folder") or "",
             "date": ra.timestamp() if ra else None,
+            "code": _otp_extract(haystack) or "",
             "body": (body or "").strip()[:4000],
         })
         if len(out) >= limit:
@@ -822,6 +826,9 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .mail .subj{font-weight:600;margin:3px 0}
  .mail pre{white-space:pre-wrap;word-break:break-word;font:12px/1.5 monospace;background:#f6f8fa;padding:8px;border-radius:6px;margin:6px 0 0;max-height:280px;overflow:auto}
  .badge{background:#eaeef2;color:#57606a;border-radius:10px;padding:1px 7px;font-size:11px}
+ .code{display:inline-flex;align-items:center;gap:8px;margin:6px 0 2px;background:#dafbe1;border:1px solid #1f883d;border-radius:8px;padding:5px 10px}
+ .code b{font:700 20px/1 monospace;letter-spacing:3px;color:#1a7f37}
+ .code button{padding:2px 8px;font-size:12px}
 </style></head><body>
 <header>
   <h1>Outlook 账号池</h1>
@@ -877,6 +884,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  function fmtTime(t){if(!t)return"";const d=new Date(t*1000);return d.toLocaleString();}
  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
  function closeMails(){$("#mailOverlay").classList.remove("on");$("#mailBody").innerHTML="";}
+ async function copyCode(code,btn){try{await navigator.clipboard.writeText(code);const t=btn.textContent;btn.textContent="已复制";setTimeout(()=>btn.textContent=t,1200);}catch(e){}}
  document.addEventListener("keydown",e=>{if(e.key==="Escape")closeMails();});
  async function viewMails(id){
    $("#mailTitle").textContent="邮件 #"+id;
@@ -891,6 +899,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
      $("#mailBody").innerHTML=mails.map(m=>`<div class="mail">
        <div class="meta"><span>${esc(m.from)}</span><span>${m.date?fmtTime(m.date):""}</span>${m.folder?`<span class="badge">${esc(m.folder)}</span>`:""}</div>
        <div class="subj">${esc(m.subject)||"(无主题)"}</div>
+       ${m.code?`<div class="code"><b>${esc(m.code)}</b><button onclick="copyCode('${esc(m.code)}',this)">复制</button></div>`:""}
        ${m.body?`<pre>${esc(m.body)}</pre>`:'<div class="muted" style="font-size:12px">(无正文)</div>'}
      </div>`).join("");
    }catch(e){$("#mailBody").innerHTML=`<div class="mail" style="color:#cf222e">${esc(e.message||e)}</div>`;}
