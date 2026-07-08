@@ -37,6 +37,16 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+import base64
+import email as email_pkg
+import html as html_lib
+import imaplib
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
+from email.utils import getaddresses, parsedate_to_datetime
+
+import requests
+
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -45,6 +55,27 @@ POOL_DB = os.getenv("POOL_DB", os.path.join(os.path.dirname(os.path.abspath(__fi
 LEASE_TTL_SECONDS = int(os.getenv("POOL_LEASE_TTL", "1200"))  # crashed-job lease auto-expires -> stale
 THUNDERBIRD_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GMAIL_DOMAINS = ("gmail.com", "googlemail.com")
+
+# --- OTP relay: read the mailbox server-side (this VPS can reach office365, unlike a
+# datacenter consumer such as gpt2api on HF) and hand back the OpenAI/ChatGPT code. ---
+TOKEN_ENDPOINT = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+IMAP_HOST = "outlook.office365.com"
+GMAIL_IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+IMAP_FOLDERS = ("INBOX", "Junk")
+GMAIL_FOLDERS = ("INBOX", "[Gmail]/Spam")
+IMAP_CONNECT_TIMEOUT = 20
+ACCESS_TOKEN_SKEW = 60
+OTP_PATTERNS = (
+    r"(?is)(?:temporary\s+(?:openai|chatgpt)\s+login\s+code(?:\s+is)?|"
+    r"verification\s+code(?:\s+is)?|one[-\s]*time\s+(?:password|code)|"
+    r"security\s+code|login\s+code(?:\s+is)?|code(?:\s+is)?|"
+    r"验证码(?:为|是)?|校验码|动态码)\D{0,24}(\d{4,8})",
+    r"\b(\d{6})\b",
+)
+_otp_token_cache: dict[str, tuple[str, float]] = {}
+_otp_token_lock = threading.Lock()
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 TERMINAL_OK = "success"
@@ -168,6 +199,162 @@ def _redact(row: sqlite3.Row) -> dict[str, Any]:
     pw = d.get("password") or ""
     d["password"] = ("•" * min(len(pw), 6)) if pw else ""
     return d
+
+
+def _xoauth2_bytes(email_addr: str, access_token: str) -> bytes:
+    return f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01".encode()
+
+
+def _otp_access_token(base: str, refresh_token: str, client_id: str) -> tuple[str, str]:
+    """(access_token, rotated_refresh_token_or_''). Cached per base mailbox so repeated
+    OTP polls during one signup don't keep rotating the MSA refresh token."""
+    with _otp_token_lock:
+        cached = _otp_token_cache.get(base)
+        if cached and time.time() < cached[1] - ACCESS_TOKEN_SKEW:
+            return cached[0], ""
+    resp = requests.post(TOKEN_ENDPOINT, data={
+        "grant_type": "refresh_token", "client_id": client_id or THUNDERBIRD_CLIENT_ID,
+        "refresh_token": refresh_token, "scope": IMAP_SCOPE}, timeout=30)
+    data = resp.json()
+    if "access_token" not in data:
+        raise RuntimeError(f"token refresh failed: {data.get('error')} {data.get('error_description')}")
+    at = str(data["access_token"])
+    with _otp_token_lock:
+        _otp_token_cache[base] = (at, time.time() + float(data.get("expires_in") or 3600))
+    new_rt = str(data.get("refresh_token") or "")
+    return at, (new_rt if new_rt and new_rt != refresh_token else "")
+
+
+def _otp_decode_hdr(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return str(value)
+
+
+def _otp_part_to_text(part: Any) -> str:
+    try:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return str(part.get_payload())
+        return payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+    except Exception:
+        try:
+            return str(part.get_payload())
+        except Exception:
+            return ""
+
+
+def _otp_parse_message(msg: Any) -> tuple[str, str, str]:
+    subject = _otp_decode_hdr(msg.get("Subject", ""))
+    text_body, html_body = "", ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            if "attachment" in (part.get("Content-Disposition") or "").lower():
+                continue
+            ctype = part.get_content_type()
+            if ctype == "text/plain" and not text_body:
+                text_body = _otp_part_to_text(part)
+            elif ctype == "text/html" and not html_body:
+                html_body = _otp_part_to_text(part)
+    else:
+        decoded = _otp_part_to_text(msg)
+        if msg.get_content_type() == "text/html":
+            html_body = decoded
+        else:
+            text_body = decoded
+    return subject, text_body, html_body
+
+
+def _otp_recipients(msg: Any) -> set[str]:
+    vals: list[str] = []
+    for header in ("To", "Cc"):
+        vals.extend(msg.get_all(header, []) or [])
+    return {addr.strip().lower() for _, addr in getaddresses(vals) if addr and "@" in addr}
+
+
+def _otp_parse_dt(value: Any):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+        return None if dt is None else (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc))
+    except Exception:
+        return None
+
+
+def _otp_html_to_text(value: Any) -> str:
+    content = str(value or "")
+    if not content:
+        return ""
+    content = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", content)
+    content = re.sub(r"(?i)<br\s*/?>", "\n", content)
+    content = re.sub(r"(?i)</(?:p|div|tr|table|h[1-6]|li|td|section|article)>", "\n", content)
+    content = re.sub(r"(?s)<[^>]+>", " ", content)
+    content = html_lib.unescape(content)
+    return re.sub(r"[\t\r\f\v ]+", " ", content).strip()
+
+
+def _otp_extract(text: str) -> str:
+    if not text:
+        return ""
+    for regex in OTP_PATTERNS:
+        match = re.search(regex, text)
+        if match:
+            val = match.group(1) if match.groups() else match.group(0)
+            if val and val != "177010":
+                return val
+    return ""
+
+
+def _otp_collect(conn: imaplib.IMAP4_SSL, folders: tuple[str, ...], per_folder: int = 10) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for folder in folders:
+        typ, _ = conn.select(folder, readonly=True)
+        if typ != "OK":
+            continue
+        typ, data = conn.search(None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            continue
+        for msg_id in reversed(data[0].split()[-per_folder:]):
+            typ, msg_data = conn.fetch(msg_id, "(RFC822)")
+            if typ != "OK" or not msg_data or not msg_data[0]:
+                continue
+            msg = email_pkg.message_from_bytes(msg_data[0][1])
+            subject, text_body, html_body = _otp_parse_message(msg)
+            out.append({"subject": subject, "text": text_body, "html": html_body,
+                        "recipients": _otp_recipients(msg), "received_at": _otp_parse_dt(msg.get("Date"))})
+    out.sort(key=lambda m: m["received_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return out
+
+
+def _otp_read_outlook(email_addr: str, access_token: str) -> list[dict[str, Any]]:
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_CONNECT_TIMEOUT)
+    try:
+        conn.authenticate("XOAUTH2", lambda _c: _xoauth2_bytes(email_addr, access_token))
+        return _otp_collect(conn, IMAP_FOLDERS)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def _otp_read_gmail(login_email: str, app_password: str) -> list[dict[str, Any]]:
+    conn = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, IMAP_PORT, timeout=IMAP_CONNECT_TIMEOUT)
+    try:
+        conn.login(login_email, app_password)
+        return _otp_collect(conn, GMAIL_FOLDERS)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Outlook Account Pool", docs_url=None, redoc_url=None)
@@ -315,6 +502,66 @@ def report_result(acct_id: int, payload: dict = Body(...)) -> dict[str, Any]:
     return {"ok": True, "id": acct_id, "status": status}
 
 
+@app.get("/api/accounts/{acct_id}/otp", dependencies=[Depends(require_key)])
+def fetch_otp(acct_id: int, lease_token: str = Query(default=""), since: float = Query(default=0.0),
+              exclude: str = Query(default="")) -> dict[str, Any]:
+    """Server-side OTP relay: read this account's mailbox over IMAP (this VPS can reach
+    office365 / gmail) and return the newest OpenAI/ChatGPT verification code addressed to
+    this exact alias. For consumers whose egress can't reach IMAP directly (gpt2api on HF).
+
+    Query: lease_token (optional, must match if the row is leased), since (unix ts — ignore
+    mail older than this, to skip stale codes from a prior attempt), exclude (csv of codes
+    already used, so a second call returns a fresh one). Returns {"code": str|null, "email"}."""
+    with _tx() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (acct_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "account not found")
+    if lease_token and row["lease_token"] and lease_token != row["lease_token"]:
+        raise HTTPException(409, "lease_token mismatch (account re-leased?)")
+    email_addr = (row["email"] or "").strip().lower()
+    base = _strip_plus(email_addr)
+    is_gmail = email_addr.split("@")[-1] in GMAIL_DOMAINS
+    excluded = {c.strip() for c in str(exclude or "").split(",") if c.strip()}
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromtimestamp(float(since), tz=timezone.utc) - timedelta(seconds=90)
+        except Exception:
+            since_dt = None
+    try:
+        if is_gmail:
+            if not row["password"]:
+                raise HTTPException(422, "gmail account has no app password")
+            mails = _otp_read_gmail(base, row["password"])
+        else:
+            if not row["refresh_token"]:
+                raise HTTPException(422, "outlook account has no refresh_token")
+            access_token, new_rt = _otp_access_token(base, row["refresh_token"], row["client_id"])
+            if new_rt:  # MSA rotated the RT — persist to every alias row sharing this mailbox
+                local, _, domain = base.partition("@")
+                with _tx() as conn:
+                    conn.execute(
+                        "UPDATE accounts SET refresh_token=?, updated_at=? WHERE email=? OR email LIKE ?",
+                        (new_rt, _now(), base, f"{local}+%@{domain}"))
+            mails = _otp_read_outlook(base, access_token)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"imap read failed: {str(exc)[:200]}")
+    for mail in mails:
+        recipients = mail.get("recipients") or set()
+        if recipients and email_addr not in recipients:
+            continue  # +N aliases share one inbox; only accept mail addressed to this alias
+        if since_dt and mail.get("received_at") and mail["received_at"] < since_dt:
+            continue
+        haystack = "\n".join(x for x in (mail.get("subject") or "", mail.get("text") or "",
+                                         _otp_html_to_text(mail.get("html"))) if x)
+        code = _otp_extract(haystack)
+        if code and code not in excluded:
+            return {"code": code, "email": email_addr}
+    return {"code": None, "email": email_addr}
+
+
 @app.post("/api/accounts/{acct_id}/retry", dependencies=[Depends(require_key)])
 def retry(acct_id: int) -> dict[str, Any]:
     with _tx() as conn:
@@ -401,6 +648,17 @@ def _strip_plus(email: str) -> str:
     if not sep:
         return email
     return f"{local.split('+', 1)[0]}@{domain}"
+
+
+@app.get("/api/accounts/{acct_id}/export", response_class=PlainTextResponse, dependencies=[Depends(require_key)])
+def export_one(acct_id: int) -> str:
+    """导出单个账号的登录收码凭证行（完整、未脱敏）：
+    outlook=email----pw----cid----rt；gmail=email----app_password。用于登录邮箱 + 收 OTP。"""
+    with _tx() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (acct_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "account not found")
+    return _export_line(row)
 
 
 @app.get("/api/export", response_class=PlainTextResponse, dependencies=[Depends(require_key)])
@@ -538,6 +796,7 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
        <td class="reason">${a.reason||""}</td>
        <td class="muted">${fmtTime(a.updated_at)}</td>
        <td>
+         <button onclick="exportOne(${a.id})" title="复制登录收码凭证">导出</button>
          ${a.status!=='available'?`<button onclick="act(${a.id},'retry')">重置</button>`:""}
          ${a.status!=='disabled'?`<button onclick="act(${a.id},'disable')">停用</button>`:""}
          <button class="danger" onclick="del(${a.id})">删</button>
@@ -554,6 +813,13 @@ INDEX_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  async function resetAll(){if(!confirm("把所有非停用账号重置为 available?"))return;const r=await api("/api/reset-all",{method:"POST"});$("#msg").textContent=`已重置 ${r.reset} 个`;refresh();}
  async function expandPlus(){if(!confirm("给每个 base 号补 +1..+5 别名(共6)?"))return;const r=await api("/api/expand-plus",{method:"POST",body:JSON.stringify({plus:5})});$("#msg").textContent=`新增 ${r.added} 个别名`;refresh();}
  async function exportBases(){const r=await fetch("/api/export",{headers:{"X-API-Key":key()}});if(!r.ok){$("#msg").textContent="导出失败("+r.status+")";return;}const t=await r.text();const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t],{type:"text/plain"}));a.download="pool-bases.txt";a.click();URL.revokeObjectURL(a.href);$("#msg").textContent="已导出母号 "+(t.trim()?t.trim().split("\\n").length:0)+" 个";}
+ async function exportOne(id){
+   const r=await fetch(`/api/accounts/${id}/export`,{headers:{"X-API-Key":key()}});
+   if(!r.ok){$("#msg").textContent="导出失败("+r.status+")";return;}
+   const t=(await r.text()).trim();
+   try{await navigator.clipboard.writeText(t);$("#msg").textContent="已复制 #"+id+" 登录收码凭证";}
+   catch(e){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([t+"\\n"],{type:"text/plain"}));a.download="acct-"+id+".txt";a.click();URL.revokeObjectURL(a.href);$("#msg").textContent="已导出 #"+id;}
+ }
  async function del(id){if(!confirm("删除 #"+id+"?"))return;await api(`/api/accounts/${id}`,{method:"DELETE"});refresh();}
  refresh();setInterval(refresh,8000);
 </script>
